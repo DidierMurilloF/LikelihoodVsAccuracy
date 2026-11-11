@@ -41,36 +41,6 @@ install.packages(c("distill", "rmarkdown", "dplyr", "tidyr", "ggplot2",
    Rscript scripts/robustness_checks.R
    ```
 
-4. Optionally, redraw the banner `images/banner.png` and the 1200 x 630
-   social preview `images/preview.png` from `results/curves_iid.rds`:
-
-   ```sh
-   Rscript scripts/make_banner.R
-   ```
-
-5. Knit `index.Rmd` (for example with `rmarkdown::render("index.Rmd")` or the
-   Knit button in RStudio). Every result over replicate trials is read from
-   `results/`; knitting also refits a few single trials live (the oracle
-   check, the likelihood hills, the AI-REML demonstration and the trial of the
-   reveal); the whole knit takes about 20 seconds.
-
-## Layout
-
-- `index.Rmd`: the article (distill); knitting writes `index.html`
-- `R/`: base-R modules (settings, oracle, simulation, metrics, AI-REML, experiments)
-- `scripts/`: `run_simulations.R` (all experiments), `profile_coverage.R`
-  (profile-likelihood intervals), `robustness_checks.R` (Myth 2 checks),
-  `make_banner.R` (banner and social preview)
-- `results/`: the saved results (`.rds`) the article reads
-- `images/`: banner and social preview
-
-## Deploy notes
-
-The social preview tags (`og:image`, `og:url`, `twitter:card`) come from
-`base_url` and `preview` in the YAML header of `index.Rmd`. The article is
-served by Vercel at <https://likelihoodvsaccuracy.vercel.app/>; if the site
-moves, change `base_url` and knit again.
-
 ## License
 
 The code (`R/`, `scripts/`) is released under the MIT License (see
