@@ -3,7 +3,7 @@ title: "Likelihood vs Prediction Accuracy in Mixed Models"
 author: "Didier Murillo"
 date: "2026-11-10"
 description: "A higher REML log-likelihood does not guarantee more accurate predictions. We show why with simulated trials, where the true genetic values are known, and a small, transparent REML oracle written in base R."
-base_url: https://likelihood-vs-accuracy.vercel.app
+base_url: https://likelihoodvsaccuracy.vercel.app
 preview: images/preview.png
 output:
   distill::distill_article:

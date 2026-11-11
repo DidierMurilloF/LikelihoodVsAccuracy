@@ -67,10 +67,9 @@ install.packages(c("distill", "rmarkdown", "dplyr", "tidyr", "ggplot2",
 ## Deploy notes
 
 The social preview tags (`og:image`, `og:url`, `twitter:card`) come from
-`base_url` and `preview` in the YAML header of `index.Rmd`. `base_url` is set
-to `https://likelihood-vs-accuracy.vercel.app`, a placeholder until the
-Vercel deployment confirms the address; if the site ends up elsewhere, change
-`base_url` and knit again.
+`base_url` and `preview` in the YAML header of `index.Rmd`. The article is
+served by Vercel at <https://likelihoodvsaccuracy.vercel.app/>; if the site
+moves, change `base_url` and knit again.
 
 ## License
 
