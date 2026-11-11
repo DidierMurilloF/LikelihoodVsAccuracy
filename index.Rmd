@@ -1,0 +1,1819 @@
+---
+title: "Likelihood vs Prediction Accuracy in Mixed Models"
+author: "Didier Murillo"
+date: "2026-11-10"
+description: "A higher REML log-likelihood does not guarantee more accurate predictions. We show why with simulated trials, where the true genetic values are known, and a small, transparent REML oracle written in base R."
+base_url: https://likelihood-vs-accuracy.vercel.app
+preview: images/preview.png
+output:
+  distill::distill_article:
+    highlight: kate
+---
+
+```{r setup, include=FALSE, comment=NA}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  comment = NA
+)
+```
+
+<img src="images/banner.png" style="width:100%; display:block; margin:auto;" alt="Likelihood hill banner">
+
+```{r, echo=FALSE, eval=TRUE, warning=FALSE, comment=NA, include=FALSE}
+suppressMessages({
+  suppressWarnings({
+    library(dplyr)
+    library(tidyr)
+    library(ggplot2)
+    library(patchwork)
+    library(kableExtra)
+  })
+})
+
+# The oracle and the simulation helpers (used for display, for the small
+# checks below and to refit a few single trials; no experiment is re-run when
+# knitting).
+source("R/settings.R")
+for (f in setdiff(sort(list.files("R", pattern = "\\.R$", full.names = TRUE)),
+                  "R/settings.R")) {
+  source(f)
+}
+
+# Every result in the article comes from these files, written by
+# scripts/run_simulations.R (profile intervals: scripts/profile_coverage.R;
+# robustness checks: scripts/robustness_checks.R).
+res <- list(
+  summary   = readRDS("results/summary.rds"),
+  spurious  = readRDS("results/two_analysts_spurious.rds"),
+  real      = readRDS("results/two_analysts_real.rds"),
+  weak      = readRDS("results/replicates_weak.rds"),
+  baseline  = readRDS("results/replicates_baseline.rds"),
+  strong    = readRDS("results/replicates_strong.rds"),
+  curves    = readRDS("results/curves_iid.rds"),
+  exp_iid   = readRDS("results/expected_curves_iid.rds"),
+  kin       = readRDS("results/curves_kinship.rds"),
+  exp_kin   = readRDS("results/expected_curves_kinship.rds"),
+  conv      = readRDS("results/convergence.rds"),
+  prof      = readRDS("results/profile_coverage.rds"),
+  robust    = readRDS("results/robustness_checks.rds")    # scripts/robustness_checks.R
+)
+
+# Same definitions as scripts/run_simulations.R.
+LOGLIK_TOL <- 1e-6                 # "A higher" means loglik_A - loglik_B > 1e-6
+LRT_CRIT <- qchisq(0.90, 1)        # 5% cutoff of the 0.5 chi2_0 + 0.5 chi2_1 mixture
+
+# Social preview: distill writes og:image and the Twitter card tags from
+# base_url and preview in the YAML header, but og:url only from canonical_url,
+# which this self-contained page cannot use (pandoc would fetch and embed the
+# page it points to). Add that one tag to <head>, from the same base_url.
+knitr::knit_meta_add(list(htmltools::htmlDependency(
+  "og-url", "1.0", src = c(href = rmarkdown::metadata$base_url),
+  head = sprintf('<meta property="og:url" content="%s/" />', rmarkdown::metadata$base_url)
+)))
+
+# Formatting helpers for inline numbers.
+fmt <- function(x, digits = 3) formatC(x, format = "f", digits = digits)
+pct <- function(x, digits = 1) paste0(formatC(100 * x, format = "f", digits = digits), "%")
+sci <- function(x) {
+  e <- floor(log10(abs(x)))
+  paste0(formatC(x / 10^e, format = "f", digits = 1), " &times; 10<sup>", e, "</sup>")
+}
+```
+
+```{r, echo=FALSE, eval=TRUE, warning=FALSE, comment=NA}
+my_theme <- theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title.x = element_text(size = 12, margin = margin(t = 8)),
+    axis.title.y = element_text(size = 12, margin = margin(r = 8)),
+    axis.text.x  = element_text(size = 9),
+    axis.text.y  = element_text(size = 9),
+    strip.text = element_text(size = 11, face = "bold"),
+    legend.position = "top",
+    legend.title = element_text(size = 11),
+    legend.text = element_text(size = 10),
+    panel.grid.minor = element_blank()
+  )
+
+col_main   <- "#2a78d6"   # blue
+col_accent <- "#eb6834"   # orange
+col_third  <- "#1baf7a"   # aqua
+col_ink    <- "#52514e"
+```
+
+```{css, echo=FALSE}
+/* A wider text column on desktop. Distill's text column is at most 704px;
+   this one grows with the window up to 8 x 94px + 7 x 16px = 864px. All the
+   distill grids (title, byline, article, appendix, footer) share the same
+   template, so everything placed in the text column stays aligned. The
+   "body" prefix outranks distill's own rules at every breakpoint. Below
+   1000px distill's layout is unchanged. */
+@media (min-width: 1000px) {
+  body .base-grid, body distill-header, body d-title, body d-abstract,
+  body d-article, body d-appendix, body distill-appendix, body d-byline,
+  body d-footnote-list, body d-citation-list, body distill-footer {
+    grid-template-columns:
+      [screen-start] minmax(16px, 1fr)
+      [page-start kicker-start] minmax(0, 50px)
+      [middle-start] minmax(0, 50px)
+      [text-start kicker-end] repeat(8, minmax(0, 94px))
+      [text-end gutter-start] minmax(0, 50px)
+      [middle-end] minmax(0, 50px)
+      [page-end gutter-end] minmax(16px, 1fr) [screen-end];
+    grid-column-gap: 16px;
+  }
+}
+.takeaway {
+  border-left: 5px solid #2a78d6;
+  background: #f2f6fc;
+  padding: 0.8em 1.2em;
+  margin: 1.5em 0;
+  border-radius: 4px;
+}
+.takeaway p:first-child { margin-top: 0; }
+.takeaway p:last-child, .takeaway ul:last-child { margin-bottom: 0; }
+.plainwords {
+  border-left: 5px solid #1baf7a;
+  background: #f1f9f5;
+  padding: 0.8em 1.2em;
+  margin: 1.5em 0;
+  border-radius: 4px;
+}
+.plainwords p:first-child { margin-top: 0; }
+.plainwords p:last-child { margin-bottom: 0; }
+.glance {
+  border-left: 5px solid #eb6834;
+  background: #fdf5f0;
+  padding: 0.8em 1.2em;
+  margin: 1.5em 0;
+  border-radius: 4px;
+}
+.glance p:first-child { margin-top: 0; }
+.glance p:last-child { margin-bottom: 0; }
+.glance ol { margin-bottom: 0.6em; }
+.glance li { margin-bottom: 0.35em; }
+details.fold {
+  border-left: 5px solid #c9d3e0;
+  background: #f8f9fb;
+  padding: 0.55em 1.2em;
+  margin: 1.2em 0;
+  border-radius: 4px;
+}
+details.fold > summary {
+  cursor: pointer;
+  color: #2a78d6;
+  font-weight: 600;
+  font-size: 0.95em;
+  line-height: 1.5;
+}
+details.fold > summary:hover { text-decoration: underline; }
+details.fold[open] > summary { margin-bottom: 0.8em; }
+details.fold > p:last-child, details.fold > ul:last-child { margin-bottom: 0.3em; }
+details.fold img { max-width: 100%; height: auto; }
+details.fold table { font-size: 0.9em; }
+/* Distill clips anything wider than the text column (d-article hides
+   horizontal overflow). Wide tables and equations scroll sideways instead,
+   which matters most on phones. */
+.table-scroll { overflow-x: auto; max-width: 100%; margin-bottom: 1.5rem; }
+.table-scroll > table { margin-bottom: 0.3rem; }
+d-article .MathJax_Display { overflow-x: auto; overflow-y: hidden; max-width: 100%; }
+/* Figures fill the (wider) text column, so both edges line up with the text.
+   Distill writes each figure's width inline, hence !important. */
+d-article img[width] { width: 100% !important; height: auto; }
+d-article .html-widget { width: 100% !important; }
+```
+
+```{js, echo=FALSE}
+// Widgets and figures inside a closed fold have no width when the page loads;
+// tell them to resize when a fold is opened.
+document.addEventListener("toggle", function (e) {
+  if (e.target.tagName === "DETAILS" && e.target.open) {
+    window.dispatchEvent(new Event("resize"));
+  }
+}, true);
+// Put every table in a box that scrolls sideways when the table is wider
+// than the text column (see .table-scroll above).
+// Distill rebuilds parts of the page after loading, so wrap on "load".
+window.addEventListener("load", function () {
+  document.querySelectorAll("d-article table").forEach(function (t) {
+    if (t.parentElement.classList.contains("table-scroll")) return;
+    var box = document.createElement("div");
+    box.className = "table-scroll";
+    t.parentNode.insertBefore(box, t);
+    box.appendChild(t);
+  });
+});
+```
+
+```{r, echo=FALSE}
+# Facts about the designs, straight from the settings.
+sa <- SETTINGS$analysts
+n_geno <- length(sa$rep_counts)
+n_analysts <- sum(sa$rep_counts)
+n_two_plot <- sum(sa$rep_counts == 2)
+n_one_plot <- sum(sa$rep_counts == 1)
+n_family <- n_geno / sa$family_size
+n_block <- ceiling(n_analysts / sa$block_size)
+n_rep <- res$summary$n_rep
+k_top <- round(SETTINGS$top_frac * n_geno)
+
+# The hook: the first replicate (by seed) of the spurious-family experiment in
+# which Analyst A's likelihood-ratio test is "significant" at 5%.
+sp <- res$spurious
+hook <- sp[which(sp$lrt > LRT_CRIT)[1], ]
+hook_p <- 0.5 * pchisq(hook$lrt, 1, lower.tail = FALSE)
+# The prose says the two analysts advance different top-10% lists.
+stopifnot(hook$topk_A != hook$topk_B)
+```
+
+### Introduction: The Higher-Likelihood Trap
+
+Two analysts receive the same field trial: `r n_geno` genotypes, `r n_two_plot` of them planted in two plots and the other `r n_one_plot` in a single plot (`r n_analysts` plots in total, a partially replicated design). The genotypes come from `r n_family` families of `r sa$family_size` genotypes each. Both analysts fit a linear mixed model with a random genotype effect, estimate the variance components by REML, and rank the genotypes by their predicted genetic values (BLUPs). The top `r k_top` genotypes (the top 10%) will be advanced.
+
+- **Analyst B** fits genotype only.
+- **Analyst A** adds a random family effect. Their REML log-likelihood goes up, from `r fmt(hook$loglik_B, 2)` to `r fmt(hook$loglik_A, 2)`, and the formal likelihood-ratio test agrees: statistic `r fmt(hook$lrt, 2)`, p = `r fmt(hook_p, 3)` against the standard boundary-corrected reference ($\tfrac12\chi^2_0 + \tfrac12\chi^2_1$, a large-sample approximation). The family variance is estimated at `r fmt(hook$sigma2_extra_hat, 3)`.
+
+Analyst A predicts each genotype as its own effect plus its family's effect, so the two analysts advance different lists. Whose list would you trust? Most of us would pick Analyst A: the model "fits better", and the test says the family effect is real.
+
+This article is about why that instinct can be wrong. A higher REML log-likelihood means that the variance parameters explain the *observed* data better under the assumed model. It does not guarantee more accurate predictions of the genetic values we select on. Accuracy depends on which terms the model contains and where their variance estimates land (an extra term whose variance is estimated above zero changes every prediction), not on the height of the likelihood. The numbers we report from a trial, such as heritability and predicted gain, also depend on how well the data pin those estimates down.
+
+There is a second, related habit. Anyone who has fitted mixed models in ASReml has seen this message:
+
+```
+Warning: Log-likelihood not converged
+```
+
+The usual response is to run `update()` until the warning goes away, or to ignore it because the BLUPs barely change. We will come back to this warning later and see what it does and does not put at risk.
+
+To answer these questions honestly we need to know the truth, so everything here is **simulated**: the true genetic value of every genotype is known, and accuracy is measured directly as the correlation between predicted and true genetic values, plus the share of the true top 10% that each analyst selects. All models are fitted with a short REML/BLUP "oracle" in base R with dense linear algebra, shown in full; no commercial or specialized mixed-model software produces any result. Each experiment is repeated over `r n_rep` simulated trials with fixed seeds, so we report how often a pattern holds, not one lucky example.
+
+```{r, echo=FALSE}
+# Myth 1 statistics, computed here because the summary box below uses them.
+analysts_tbl <- function(d) {
+  d <- d[is.na(d$error), ]
+  higher <- d$loglik_A - d$loglik_B > LOGLIK_TOL
+  both_ok <- !d$degenerate_A & !d$degenerate_B
+  worse <- d$cor_A < d$cor_B
+  signif <- d$lrt > LRT_CRIT
+  list(
+    n = nrow(d),
+    n_extra_pos = sum(d$sigma2_extra_hat > 0),
+    n_higher_raw = sum(d$loglik_A > d$loglik_B),
+    n_higher = sum(higher),
+    p_higher = mean(higher),
+    n_higher_ok = sum(higher & both_ok),
+    p_worse_higher = mean(worse[higher & both_ok]),
+    n_signif = sum(signif),
+    n_signif_ok = sum(signif & both_ok),
+    n_worse_signif = sum(worse[signif & both_ok]),
+    p_signif = mean(signif),
+    cor_A = mean(d$cor_A[both_ok]),
+    cor_B = mean(d$cor_B[both_ok]),
+    topk_A = mean(d$topk_A[both_ok]),
+    topk_B = mean(d$topk_B[both_ok]),
+    deg_A = sum(d$degenerate_A),
+    deg_B = sum(d$degenerate_B)
+  )
+}
+s_sp <- analysts_tbl(res$spurious)
+s_rb <- analysts_tbl(res$real)
+max_rounding <- with(res$spurious, max(abs(lrt[sigma2_extra_hat == 0])) / 2)
+# Correlation between the LRT and A's accuracy gain, over the trials where A's
+# log-likelihood is higher and both predictions are defined.
+lrt_vs_gain <- function(d) {
+  h <- is.na(d$error) & d$loglik_A - d$loglik_B > LOGLIK_TOL &
+    !d$degenerate_A & !d$degenerate_B
+  ct <- cor.test(d$lrt[h], d$cor_A[h] - d$cor_B[h])
+  list(r = unname(ct$estimate), lo = ct$conf.int[1], hi = ct$conf.int[2],
+       includes_zero = ct$conf.int[1] < 0 && ct$conf.int[2] > 0)
+}
+dc_sp <- lrt_vs_gain(res$spurious)
+dc_rb <- lrt_vs_gain(res$real)
+ci2 <- function(x) paste0(fmt(x$r, 2), " (95% CI ", fmt(x$lo, 2), " to ", fmt(x$hi, 2), ")")
+
+# Direction words in the prose below; knitting stops if a rerun changes them.
+stopifnot(
+  s_sp$p_higher < 0.5,                 # "the share is usually lower" than half
+  s_sp$p_worse_higher > 0.5,           # "usually less accurate"
+  s_sp$cor_A < s_sp$cor_B,             # spurious: A's mean accuracy lower
+  s_rb$cor_A > s_rb$cor_B,             # real block: A's mean accuracy higher
+  s_rb$p_worse_higher < 0.5,           # real block: A less accurate "only" in a minority
+  s_rb$p_worse_higher > 0,             # real block: "though not all of them"
+  dc_sp$hi < 0 || dc_sp$includes_zero, # spurious: the two branches of the inline text
+  dc_rb$includes_zero || abs(dc_rb$r) < 0.3   # real block: "a weak ... tendency"
+)
+# Rejection rate of the LRT under the null, with a binomial 95% CI.
+sig_ci <- binom.test(s_sp$n_signif, s_sp$n)$conf.int
+
+# Theory for a useless extra term (math packet, E3c): in a balanced one-way
+# layout with b levels of the extra term, m units in each and no true effect,
+# REML estimates its variance above zero, and so raises the log-likelihood,
+# exactly when the between-level mean square exceeds the within-level one:
+# P(F_{b-1, b(m-1)} > 1). We use m = our family size.
+p_pos <- function(b, m = sa$family_size) 1 - pf(1, b - 1, b * (m - 1))
+p_pos_2 <- p_pos(2)
+p_pos_nf <- p_pos(n_family)
+stopifnot(
+  all(diff(p_pos(2:500)) > 0), p_pos(500) < 0.5,   # "rising towards 50%"
+  p_pos(1e5) > 0.49                                # ... and approaching it
+)
+```
+
+<div class="glance">
+
+**The four myths at a glance**
+
+1. **"A higher log-likelihood means better predictions."** Not necessarily. A random term that does not exist still raised the log-likelihood in `r pct(s_sp$p_higher)` of our simulated trials, and when it did, the predictions were usually less accurate (`r pct(s_sp$p_worse_higher)` of those trials). Across trials or datasets, log-likelihoods are not comparable at all.
+2. **"The estimate is all that matters."** A variance estimate in the wrong place changes what you *report* (heritability, predicted gain, reliability) far more than which lines you *select*, as long as the genotypes are unrelated and similarly replicated. With a genomic relationship matrix, or with very uneven replication, the rankings move too.
+3. **"All trials are equally trustworthy."** No. Weak trials give flat hills: scattered variance estimates and boundary fits with zero genetic variance. Intervals built from standard errors change with the scale they are built on, do not exist for boundary fits, and in weak trials usually reach below zero on the heritability scale. Profile-likelihood intervals have none of these problems and show honestly how little such a trial knows.
+4. **"'Not converged' is just a warning."** It is a warning about every number that should come from the top of the hill (the log-likelihood, likelihood-ratio tests, variance components, heritability), even when the rankings of a simple genotype model barely change.
+
+**So how do you choose between models?** Cross-validation over held-out plots and the boundary-corrected likelihood-ratio test detect whether an extra term is real; neither tells you which model will predict better on the trial in front of you. The [practical checklist](#practical-checklist) at the end turns all of this into a short list of rules.
+
+</div>
+
+### The likelihood hill
+
+Most of what follows can be read off one picture. For a model with a genotype effect and a residual, the REML log-likelihood depends on the variance components only through their ratio, which we can express as a heritability, $h^2 = \sigma^2_g / (\sigma^2_g + \sigma^2_e)$, once the residual variance is set to its best value for each $h^2$. Plotting that *profile* log-likelihood against $h^2$ gives a hill. Here $h^2$ is broad-sense heritability on a plot basis (what many breeders write as $H^2$); programs usually report heritability on an entry-mean basis, which is higher whenever entries have several plots (Cullis, Smith and Coombes 2006; Piepho and Möhring 2007).
+
+```{r, echo=FALSE}
+cv <- res$curves
+gamma_hat <- attr(cv, "gamma_hat")
+gamma_true <- attr(cv, "gamma_true")
+h2_hat <- gamma_hat / (1 + gamma_hat)
+h2_true <- gamma_true / (1 + gamma_true)
+ll_max <- max(cv$loglik)
+
+# Values of h2 within qchisq(0.95, 1) / 2 log-likelihood units of the peak:
+# an approximate 95% profile-likelihood interval.
+drop_95 <- qchisq(0.95, 1) / 2
+top <- cv$h2[cv$loglik >= ll_max - drop_95]
+h2_lo <- min(top)
+h2_hi <- max(top)
+
+sb <- SETTINGS$baseline
+n_base <- sum(sb$rep_counts)
+n_base_two <- sum(sb$rep_counts == 2)
+n_base_one <- sum(sb$rep_counts == 1)
+```
+
+```{r, fig.align="c", fig.width=8, fig.height=4.5, echo=FALSE, eval=TRUE}
+hill <- subset(cv, loglik >= ll_max - 12)
+ggplot(hill, aes(h2, loglik)) +
+  annotate("rect", xmin = h2_lo, xmax = h2_hi, ymin = -Inf, ymax = Inf,
+           fill = col_main, alpha = 0.12) +
+  geom_line(colour = col_main, linewidth = 1.2) +
+  geom_vline(xintercept = h2_hat, colour = col_accent, linewidth = 0.8) +
+  geom_vline(xintercept = h2_true, colour = col_ink, linewidth = 0.8, linetype = "dashed") +
+  annotate("label", x = h2_hat, y = ll_max - 10.5, label = "REML estimate (peak)",
+           colour = col_accent, size = 3.6, hjust = -0.05, label.size = 0) +
+  annotate("label", x = h2_true, y = ll_max - 10.5, label = "true h²",
+           colour = col_ink, size = 3.6, hjust = 1.05, label.size = 0) +
+  labs(title = "The likelihood hill for one simulated trial",
+       x = expression("Heritability " * h^2 * " (plot level)"),
+       y = "Profile REML log-likelihood") +
+  my_theme
+```
+
+This is one simulated trial of the baseline design (`r n_base_two` genotypes with two plots, `r n_base_one` with one; true $h^2$ = `r fmt(h2_true, 1)`). Three features of the hill matter, and only two of them are about the variance estimate:
+
+- **Where the peak sits.** The REML estimate is the top of the hill, here $\hat h^2$ = `r fmt(h2_hat, 3)`. It is not the true value (`r fmt(h2_true, 1)`): it is the value that best explains *this* dataset, noise included.
+- **How wide the hill is.** The shaded band holds the values of $h^2$ whose log-likelihood is within `r fmt(drop_95, 2)` units of the peak, roughly a 95% profile-likelihood interval: from `r fmt(h2_lo, 2)` to `r fmt(h2_hi, 2)`. A flat, wide hill means the data cannot tell those values apart.
+- **How high the peak is.** The peak value, `r fmt(ll_max, 1)`, is a property of this dataset. On its own it says nothing about how good the predictions are.
+
+<div class="plainwords">
+
+**In plain words:** the REML log-likelihood tells you which variance components best explain the data you have. Its peak is your estimate and its width is your uncertainty. Its height is not a score for prediction quality, and in the rest of the article we will keep asking what the height can and cannot tell us.
+
+</div>
+
+### Building the oracle
+
+We use the standard model for a single trial:
+
+$$y = X\beta + Zg + e, \qquad g \sim N(0, \sigma^2_g I), \qquad e \sim N(0, \sigma^2_e I),$$
+
+where $y$ holds the plot values, $X\beta$ is the fixed part (here just an overall mean), $Z$ assigns plots to genotypes, $g$ are the genetic values we want to predict, and $e$ is the plot error. In the simulations $\sigma^2_g + \sigma^2_e = 1$, so $\sigma^2_g$ is the plot-level (broad-sense) heritability.
+
+REML ("restricted" or "residual" maximum likelihood; Patterson and Thompson 1971; Harville 1977) estimates $\sigma^2_g$ and $\sigma^2_e$ from the part of the data that is free of the fixed effects: think of it as first removing the overall mean, then asking which variance components make the remaining contrasts between plots most probable. The BLUPs then come from Henderson's mixed model equations (Henderson 1975). Computed with estimated variance components instead of the true ones, as they always are in practice, they are strictly *empirical* BLUPs; we call them BLUPs for short.
+
+<details class="fold">
+<summary>Under the hood: how REML works (the formulas)</summary>
+
+For variance components $\theta = (\sigma^2_g, \sigma^2_e)$, with $V = \sigma^2_g ZZ' + \sigma^2_e I$ and $p$ fixed-effect parameters among $n$ plots, the REML log-likelihood is
+
+<div style="font-size: 85%">
+$$\ell_R(\theta) = -\tfrac12\left[(n-p)\log 2\pi + \log|V| + \log|X'V^{-1}X| + y'Py\right], \quad P = V^{-1} - V^{-1}X(X'V^{-1}X)^{-1}X'V^{-1}.$$
+</div>
+
+Written as the likelihood of $n-p$ orthonormal error contrasts $K'y$ (with $K'X = 0$), it differs from $\ell_R$ only by the constant $\tfrac12\log|X'X|$, which does not depend on $\theta$. Different programs report different constants, which is one more reason not to compare log-likelihood values across programs.
+
+With $\gamma = \sigma^2_g/\sigma^2_e$, one eigendecomposition $K'ZZ'K = UDU'$ and $w = U'K'y$ give the whole hill cheaply. The residual variance has a closed form for each $\gamma$, and the profile log-likelihood is
+
+<div style="font-size: 85%">
+$$\hat\sigma^2_e(\gamma) = \frac{1}{n-p}\sum_j \frac{w_j^2}{1+\gamma d_j}, \qquad \ell(\gamma) = -\tfrac12\left[(n-p)(\log 2\pi + 1) + (n-p)\log\hat\sigma^2_e(\gamma) + \sum_j \log(1+\gamma d_j)\right].$$
+</div>
+
+The BLUPs solve the mixed model equations with $\lambda = 1/\gamma$:
+
+<div style="font-size: 85%">
+$$\begin{bmatrix} X'X & X'Z \\ Z'X & Z'Z + \lambda I \end{bmatrix} \begin{bmatrix} \hat\beta \\ \hat g \end{bmatrix} = \begin{bmatrix} X'y \\ Z'y \end{bmatrix}.$$
+</div>
+
+</details>
+
+<div class="plainwords">
+
+**In plain words:** after removing the mean, the data are rotated so that each piece is independent; the log-likelihood then becomes a simple sum that is cheap to evaluate for any heritability. The REML estimate is the heritability where that sum is highest. The BLUP of a genotype shrinks its observed deviation from the mean towards zero, and genotypes with fewer plots are shrunk more.
+
+</div>
+
+The whole oracle fits on one screen, and we checked it against a naive computation before trusting it.
+
+<details class="fold">
+<summary>Under the hood: the oracle code and how we checked it</summary>
+
+`reml_fit()` searches a fine grid of `r length(SETTINGS$log_gamma_grid)` values of $\log\gamma$ (plus $\gamma = 0$, the boundary where $\hat\sigma^2_g = 0$), then refines the best grid point with `optimize()`, so we can be confident we have the global maximum of the hill and not just a local bump:
+
+```{r, file="R/oracle.R", eval=FALSE, echo=TRUE}
+```
+
+```{r, echo=FALSE}
+# Small check, run when knitting: rebuild the trial of the hill figure
+# (baseline design, replicate 1) and compare the fast eigen path with the
+# naive dense computation from the full n x n matrix V.
+seed_1 <- BASE_SEED + 1
+design_1 <- make_design(sb$rep_counts, seed = seed_1)
+sim_1 <- simulate_trial(design_1, h2 = sb$h2, seed = seed_1)
+dm_1 <- design_matrices(design_1)
+setup_1 <- reml_setup(sim_1$y, dm_1$X, dm_1$Z)
+fit_1 <- reml_fit(setup_1)
+
+check_gammas <- c(0, 0.1, 0.5, 2, 20)
+fast <- reml_loglik(check_gammas, setup_1)
+naive <- vapply(check_gammas, function(g) {
+  se <- reml_sigma2_e(g, setup_1)
+  reml_loglik_naive(g * se, se, sim_1$y, dm_1$X, dm_1$Z)
+}, numeric(1))
+max_diff_naive <- max(abs(fast - naive))
+grid_gap <- fit_1$loglik - max(fit_1$grid$loglik)
+stopifnot(isTRUE(all.equal(fit_1$gamma, gamma_hat, tolerance = 1e-8)), grid_gap >= 0)
+```
+
+On the trial of the hill figure, the fast eigen-based log-likelihood and a naive computation that builds and factorizes the full `r n_base` &times; `r n_base` variance matrix agree to within `r sci(max_diff_naive)` at `r length(check_gammas)` values of $\gamma$ between `r min(check_gammas)` and `r max(check_gammas)`. The refined maximum is `r sci(grid_gap)` log-likelihood units above the best grid point (the code keeps the grid point if the optimizer ever does worse), and it is the same estimate stored in the results, $\hat\gamma$ = `r fmt(fit_1$gamma, 3)`. The test suite in the repository runs the same comparisons on more designs, including a balanced design where REML has a closed-form answer.
+
+</details>
+
+### Myth 1: A higher log-likelihood means better predictions
+
+#### Two analysts, two worlds
+
+The trial in the introduction was simulated, so we can ask how it ends. We repeated the two-analyst comparison over `r n_rep` independent trials of the same design, in two different worlds:
+
+- **Spurious family.** There is no family effect at all: genotypes in the same family are no more alike than any others. Analyst A's family term is pure noise. (The trial in the introduction came from this world.) Read "family" as any grouping label with no real variance behind it (a wrong pedigree assignment, seed lot, tray).
+- **Real block.** The field has a real block effect: consecutive groups of `r sa$block_size` plots (`r n_block` incomplete blocks) share a random block effect with variance `r fmt(sa$sigma2_block, 2)` (the genetic variance is `r fmt(sa$h2, 1)`). In this world Analyst A adds a block term instead of a family term, and that term is correct.
+
+Analyst B always fits genotype only. Because A's model contains B's as the special case where the extra variance is zero, A's maximized log-likelihood can never be lower than B's.
+
+In the **spurious-family** world, Analyst A's log-likelihood was higher in `r pct(s_sp$p_higher)` of the trials, even though the family effect does not exist, and in `r pct(s_sp$p_worse_higher)` of those trials A's predictions were *less* accurate than B's. The likelihood-ratio test called the family effect "significant" in `r s_sp$n_signif` of `r s_sp$n` trials, and A was less accurate than B in `r if (s_sp$n_worse_signif == s_sp$n_signif_ok) paste('every one of those', s_sp$n_signif_ok, 'trials') else paste(s_sp$n_worse_signif, 'of those', s_sp$n_signif_ok, 'trials')`. A's mean accuracy was also lower (`r fmt(s_sp$cor_A)` vs `r fmt(s_sp$cor_B)`).
+
+In the **real-block** world, A's log-likelihood was higher in `r pct(s_rb$p_higher)` of the trials, and A was less accurate in only `r pct(s_rb$p_worse_higher)` of those. Modeling the blocks removes field noise from the genotype comparisons, and A's mean accuracy is higher (`r fmt(s_rb$cor_A)` vs `r fmt(s_rb$cor_B)`).
+
+So the same observation, "A's log-likelihood is higher", goes with worse predictions in one world and better predictions in the other. The log-likelihood comparison cannot tell you which world you are in.
+
+```{r, fig.align="c", fig.width=10, fig.height=4.5, echo=FALSE, eval=TRUE}
+both <- bind_rows(
+  res$spurious |> mutate(world = "Spurious family (A is wrong)"),
+  res$real |> mutate(world = "Real block (A is right)")
+) |>
+  filter(is.na(error), !degenerate_A, !degenerate_B) |>
+  mutate(world = factor(world, levels = c("Spurious family (A is wrong)",
+                                          "Real block (A is right)")),
+         d_cor = cor_A - cor_B,
+         lrt = pmax(lrt, 0))
+
+ggplot(both, aes(lrt, d_cor)) +
+  geom_hline(yintercept = 0, colour = col_ink, linewidth = 0.5) +
+  geom_vline(xintercept = LRT_CRIT, colour = col_accent, linetype = "dashed",
+             linewidth = 0.7) +
+  geom_point(colour = col_main, alpha = 0.45, size = 1.8) +
+  facet_wrap(~ world, scales = "free_x") +
+  labs(title = "Gain in log-likelihood vs gain in accuracy (A minus B)",
+       x = "Likelihood-ratio statistic, 2 × (logL A − logL B)",
+       y = "Accuracy of A − accuracy of B") +
+  my_theme
+```
+
+Each point is one simulated trial; the dashed line is the 5% LRT cutoff and points above zero are trials where Analyst A predicted better.
+
+<details class="fold">
+<summary>Why not "half the time"? What theory says</summary>
+
+You may have read that a useless extra variance component raises the log-likelihood "half the time". That rule comes from large-sample theory and needs many levels of the extra effect; with a modest number of levels the share is usually lower. In a balanced design where each level of the extra term holds `r sa$family_size` units (like our families of `r sa$family_size` genotypes, with one plot each) and the term does not exist, the log-likelihood rises exactly when the extra variance is estimated above zero, and theory puts that chance at about `r pct(p_pos_2)` for an extra term with 2 levels, rising towards 50% as the number of levels grows (`r pct(p_pos_nf)` for `r n_family` levels). With `r n_family` families we saw `r pct(s_sp$p_higher)`.
+
+</details>
+
+<details class="fold">
+<summary>The numbers behind this (full table, test details and counts)</summary>
+
+When A's extra variance is estimated as exactly zero, the two models are the same model and the two log-likelihoods differ only by rounding (at most `r sci(max_rounding)` here). A naive "is A larger?" comparison would call A higher in `r s_sp$n_higher_raw` of `r s_sp$n` spurious-family trials, `r s_sp$n_higher_raw - s_sp$n_higher` of them only because of that rounding noise. We count A as higher only when its log-likelihood exceeds B's by more than `r sci(LOGLIK_TOL)`.
+
+```{r, echo=FALSE}
+row_names <- c(
+  "Trials",
+  "Extra variance estimated above zero",
+  "A's log-likelihood higher",
+  "A less accurate than B, when A's log-likelihood is higher",
+  "LRT \"significant\" at 5%",
+  "A less accurate than B, when the LRT is significant",
+  "Mean accuracy, cor(predicted, true): A",
+  "Mean accuracy, cor(predicted, true): B",
+  "Mean share of true top 10% selected: A",
+  "Mean share of true top 10% selected: B",
+  "Degenerate predictions (genetic variance = 0): A / B"
+)
+col_for <- function(s) c(
+  s$n,
+  s$n_extra_pos,
+  paste0(s$n_higher, " (", pct(s$p_higher), ")"),
+  paste0(pct(s$p_worse_higher), " (of ", s$n_higher_ok, ")"),
+  paste0(s$n_signif, " (", pct(s$p_signif), ")"),
+  paste0(s$n_worse_signif, " of ", s$n_signif_ok),
+  fmt(s$cor_A), fmt(s$cor_B),
+  fmt(s$topk_A), fmt(s$topk_B),
+  paste0(s$deg_A, " / ", s$deg_B)
+)
+data.frame(
+  Quantity = row_names,
+  `Spurious family (A is wrong)` = col_for(s_sp),
+  `Real block (A is right)` = col_for(s_rb),
+  check.names = FALSE
+) |>
+  kable(align = c("l", "r", "r"))
+```
+
+Accuracy comparisons in the table use only the trials where both analysts' predictions are defined. When REML estimates the genetic variance as zero, every genotype gets the same prediction (zero), so a correlation or a top-10% list does not exist. Those trials are counted in the last row, not hidden. The LRT uses the 5% cutoff of the standard boundary-corrected reference, an even mixture of $\chi^2_0$ and $\chi^2_1$ (cutoff `r fmt(LRT_CRIT, 2)`). That reference is a large-sample approximation (Self and Liang 1987; Stram and Lee 1994 for mixed models), and it needs many levels of the extra effect to be accurate (Crainiceanu and Ruppert 2004).
+
+In the spurious-family world the test's rejection rate was `r pct(s_sp$p_signif)` at a nominal 5% (95% CI `r pct(sig_ci[1])` to `r pct(sig_ci[2])`)`r if (sig_ci[1] <= 0.05 && sig_ci[2] >= 0.05) paste0(', within simulation noise of the nominal rate with ', n_family, ' families') else if (sig_ci[2] < 0.05) paste0(': with only ', n_family, ' families the large-sample reference is conservative here') else paste0(': with only ', n_family, ' families the large-sample reference is liberal here')`. The trial in the introduction was the first of the "significant" trials.
+
+Among the trials where A's log-likelihood was higher, the correlation between the LRT statistic and A's accuracy gain was `r ci2(dc_sp)` in the spurious-family world: `r if (dc_sp$hi < 0) 'trials where A gained more log-likelihood from the family term tended to be the ones where its predictions lost more' else 'the interval includes zero, so there is no clear pattern'`. In the real-block world it was `r ci2(dc_rb)`, `r if (dc_rb$includes_zero) 'an interval that includes zero' else if (dc_rb$lo > 0) 'a weak positive tendency' else 'a weak negative tendency'`, and `r pct(1 - s_rb$p_worse_higher)` of those trials sit above zero, though not all of them.
+
+</details>
+
+#### Replicate trials of one design
+
+```{r, echo=FALSE}
+designs <- c(weak = "Weak", baseline = "Baseline", strong = "Strong")
+rep_stats <- lapply(names(designs), function(sc) {
+  d <- res[[sc]]
+  d <- d[is.na(d$error), ]
+  ok <- !d$degenerate
+  ct <- cor.test(d$loglik_max[ok], d$cor[ok])
+  s <- SETTINGS[[sc]]
+  list(n = nrow(d), n_boundary = sum(d$boundary), n_cor = sum(ok),
+       r = unname(ct$estimate), lo = ct$conf.int[1], hi = ct$conf.int[2],
+       includes_zero = ct$conf.int[1] < 0 && ct$conf.int[2] > 0,
+       h2 = s$h2, n_plots = sum(s$rep_counts),
+       mean_cor = mean(d$cor[ok]))
+})
+names(rep_stats) <- names(designs)
+rw <- rep_stats$weak; rbase <- rep_stats$baseline; rst <- rep_stats$strong
+# "If anything, the relationship goes the other way" and the takeaway's
+# "negative in the baseline and strong designs" rely on these.
+stopifnot(rep_stats$baseline$hi < 0, rep_stats$strong$hi < 0)
+ci_txt <- function(s) paste0(fmt(s$r, 2), " (95% CI ", fmt(s$lo, 2), " to ", fmt(s$hi, 2), ")")
+
+ss <- SETTINGS$strong
+n_strong_three <- sum(ss$rep_counts == 3)
+n_strong_two <- sum(ss$rep_counts == 2)
+```
+
+The two analysts compared two models on the same data. A different temptation is to compare different trials of the same design: this season's trial reached a higher log-likelihood than last season's, so is it more reliable? We simulated `r n_rep` trials of each of three designs and fitted the genotype model to each:
+
+- **Weak:** the baseline layout (`r n_base_two` genotypes with two plots, `r n_base_one` with one; `r rw$n_plots` plots) with $h^2$ = `r fmt(rw$h2, 1)`.
+- **Baseline:** the same layout with $h^2$ = `r fmt(rbase$h2, 1)`.
+- **Strong:** `r n_strong_three` genotypes with three plots and `r n_strong_two` with two (`r rst$n_plots` plots), $h^2$ = `r fmt(rst$h2, 1)`.
+
+Trials where REML put the genetic variance at zero (the boundary of the hill) have no defined accuracy, because all predictions are equal, so they are left out here; Myth 3 returns to them.
+
+```{r, fig.align="c", fig.width=11, fig.height=4.2, echo=FALSE, eval=TRUE}
+rep_df <- bind_rows(lapply(names(designs), function(sc) {
+  res[[sc]] |>
+    filter(is.na(error), !degenerate) |>
+    mutate(design = paste0(designs[[sc]], ": cor = ", fmt(rep_stats[[sc]]$r, 2)))
+})) |>
+  mutate(design = factor(design, levels = unique(design)))
+
+ggplot(rep_df, aes(loglik_max, cor)) +
+  geom_point(colour = col_main, alpha = 0.4, size = 1.5) +
+  geom_smooth(method = "lm", formula = y ~ x, se = FALSE, colour = col_accent,
+              linewidth = 0.9) +
+  facet_wrap(~ design, scales = "free") +
+  labs(title = "Maximum log-likelihood vs accuracy across replicate trials",
+       x = "Maximized REML log-likelihood",
+       y = "Accuracy, cor(predicted, true)") +
+  my_theme
+```
+
+Within a design, the trials with a *higher* maximum log-likelihood did not have more accurate predictions. If anything, the relationship goes the other way: the correlation between the two was `r fmt(rbase$r, 2)` in the baseline design and `r fmt(rst$r, 2)` in the strong design. In the weak design it was `r fmt(rw$r, 2)`, and its 95% interval `r if (rw$includes_zero) "includes zero, so that design alone does not tell us the sign" else "excludes zero"`.
+
+<details class="fold">
+<summary>The numbers behind this (intervals and counts)</summary>
+
+The correlations between the maximized log-likelihood and accuracy, with 95% confidence intervals, were `r ci_txt(rbase)` in the baseline design, `r ci_txt(rst)` in the strong design and `r ci_txt(rw)` in the weak design; the weak interval `r if (rw$includes_zero) "includes zero: the relationship there is weak at best" else "excludes zero"`.
+
+In `r rw$n_boundary` of the `r rw$n` weak trials (`r pct(rw$n_boundary / rw$n)`), REML put the genetic variance at zero, the boundary of the hill. That also happened in `r rbase$n_boundary` baseline trials and `r rst$n_boundary` strong trials. These trials have no defined accuracy (all predictions are equal), so the figure and the correlations above use the remaining `r rw$n_cor`, `r rbase$n_cor` and `r rst$n_cor` trials.
+
+</details>
+
+<div class="plainwords">
+
+**In plain words:** the log-likelihood of a trial mostly measures how much the plot values vary, and more spread means a lower log-likelihood. A trial whose genotypes happen to differ more than usual has more spread in its data, so its log-likelihood is lower. But larger genetic differences are also easier to detect, so its predictions are more accurate. The same trial gets a lower log-likelihood and better predictions.
+
+</div>
+
+<details class="fold">
+<summary>Under the hood: why the correlation is negative</summary>
+
+```{r, echo=FALSE}
+# Approximate correlation for a balanced trial with r plots per genotype:
+# -sqrt(H2_r / (2 r)), where H2_r = r / (r + lambda) and lambda = (1 - h2) / h2.
+balanced_cor <- function(h2, r) {
+  lambda <- (1 - h2) / h2
+  -sqrt((r / (r + lambda)) / (2 * r))
+}
+ex_r <- 2
+ex_h2 <- 0.3
+ex_cor <- balanced_cor(ex_h2, ex_r)
+```
+
+In a balanced trial with $m$ genotypes and $r$ plots each, the maximized REML log-likelihood is, up to a constant,
+$$\ell_{\max} = -\tfrac12\left[(m-1)\log \text{MSB} + m(r-1)\log \text{MSW}\right],$$
+where MSB and MSW are the between- and within-genotype mean squares of the ANOVA (when the genetic variance estimate is positive). A larger realized genetic spread raises MSB and lowers $\ell_{\max}$, while it raises the accuracy. For a balanced trial, this gives an approximate correlation of $-\sqrt{H^2_r/(2r)}$ across replicate trials, where $H^2_r = r/(r + \lambda)$ is the entry-mean heritability and $\lambda = \sigma^2_e/\sigma^2_g$. For example, $r$ = `r ex_r` and $h^2$ = `r fmt(ex_h2, 1)` give `r fmt(ex_cor, 2)`. Our designs are unbalanced, so this formula is only a guide; the simulation above is the evidence.
+
+</details>
+
+#### Across trials and designs: not comparable
+
+```{r, echo=FALSE}
+# Changing units multiplies y by a constant c and shifts the REML
+# log-likelihood by -(n - p) log(c), whatever the data.
+unit_c <- 1000
+fit_kg <- reml_fit(reml_setup(sim_1$y * unit_c, dm_1$X, dm_1$Z))
+unit_shift <- fit_kg$loglik - fit_1$loglik
+unit_shift_theory <- -(setup_1$n - setup_1$p) * log(unit_c)
+# Same heritability estimate and the same ranking of genotypes after the change.
+stopifnot(
+  isTRUE(all.equal(fit_kg$gamma, fit_1$gamma, tolerance = 1e-6)),
+  identical(rank(blup(sim_1$y * unit_c, dm_1$X, dm_1$Z, fit_kg$gamma)$g),
+            rank(blup(sim_1$y, dm_1$X, dm_1$Z, fit_1$gamma)$g))
+)
+rng <- function(sc) range(res[[sc]]$loglik_max, na.rm = TRUE)
+stopifnot(
+  isTRUE(all.equal(unit_shift, unit_shift_theory)),
+  unit_shift < 0,                          # kg lowers it, so tonnes "raises it"
+  rst$mean_cor - rbase$mean_cor > 0.1      # strong trials "predict far better"
+)
+```
+
+Log-likelihoods of different trials are not even on the same scale. The strong trials predict far better than the baseline ones (mean accuracy `r fmt(rst$mean_cor, 2)` against `r fmt(rbase$mean_cor, 2)`), but the gap between their log-likelihoods says nothing about that (the figure above uses free axes on purpose). The level of a log-likelihood depends on things that have nothing to do with prediction quality:
+
+- **The amount of data.** Every residual degree of freedom adds a term to the log-likelihood, so trials with different numbers of plots sit on different scales.
+- **The units.** Recording the yield of the hill trial in kilograms instead of tonnes moves its maximized log-likelihood by `r fmt(unit_shift, 1)`, with the same heritability estimate and the same ranking of genotypes; going back to tonnes raises it by the same amount. Whether a comparison across datasets goes up or down can depend on nothing more than the units.
+- **Transformations.** A log or square-root transformation of the trait changes the data being modeled, so the log-likelihoods of the two analyses are on different scales.
+- **The fixed effects.** REML is the likelihood of the data *after* the fixed effects have been removed, so models with different fixed effects describe different sets of contrasts and their REML log-likelihoods are not comparable, even on the same data. To compare fixed effects, use maximum likelihood or the adjusted REML comparison of Welham and Thompson (1997).
+
+<details class="fold">
+<summary>The numbers behind this (log-likelihood ranges and the units check)</summary>
+
+The log-likelihoods of the baseline trials range from `r fmt(rng("baseline")[1], 0)` to `r fmt(rng("baseline")[2], 0)`, while those of the strong trials range from `r fmt(rng("strong")[1], 0)` to `r fmt(rng("strong")[2], 0)`. Multiplying every observation by a constant $c$ shifts the REML log-likelihood by $-(n-p)\log c$; for the change from tonnes to kilograms ($c$ = `r unit_c`) theory gives `r fmt(unit_shift_theory, 1)`, and the refit of the hill trial moved by `r fmt(unit_shift, 1)`.
+
+</details>
+
+Log-likelihoods are comparable only between models fitted to the same data, in the same units, with the same fixed effects, by the same program. Even then, as the two analysts showed, a bare comparison of the two numbers is not enough: judging whether the extra term is supported needs a proper test or cross-validation.
+
+<div class="takeaway">
+
+**Takeaway for breeders**
+
+- Adding a random term that is not really there still raises the REML log-likelihood in a large share of trials (`r pct(s_sp$p_higher)` in our spurious-family simulation; in theory about `r pct(p_pos_2)` for a balanced extra term with 2 levels of `r sa$family_size` units each, rising towards 50% as the number of levels grows). When it did, the predictions were usually *less* accurate (`r pct(s_sp$p_worse_higher)` of those trials).
+- The same "higher log-likelihood" came with better predictions when the extra term was real. The log-likelihood comparison alone cannot tell the two situations apart.
+- Across replicate trials of one design, a higher log-likelihood did not mean better predictions; in the baseline and strong designs the relationship was negative.
+- Never compare log-likelihoods across datasets, units, transformations, fixed effects or programs.
+
+</div>
+
+### Myth 2: The estimate is all that matters
+
+```{r, echo=FALSE}
+# Value of a curve column at any gamma (linear interpolation on log gamma).
+at_g <- function(d, col, g) approx(d$log_gamma, d[[col]], xout = log(g))$y
+h2_of <- function(g) g / (1 + g)
+
+ei <- res$exp_iid
+g0 <- attr(ei, "gamma_true")
+wrong <- 10                                   # "ten times too small / too large"
+g_lo <- g0 / wrong
+g_hi <- g0 * wrong
+
+# Expected (average over replicate trials) values at the truth and 10x off.
+e_at <- function(d, col) c(lo = at_g(d, col, g_lo), true = at_g(d, col, g0),
+                           hi = at_g(d, col, g_hi))
+ei_cor <- e_at(ei, "cor"); ei_topk <- e_at(ei, "topk")
+ei_mse <- e_at(ei, "mse"); ei_gain <- e_at(ei, "gain_slope")
+iid_cor_loss <- max(ei_cor["true"] - ei_cor[c("lo", "hi")])
+sd_cor_base <- sd(res$baseline$cor, na.rm = TRUE)
+
+# The single trial of the hill (baseline replicate 1).
+s_cor <- c(lo = at_g(cv, "cor", g_lo), true = at_g(cv, "cor", g0),
+           hat = at_g(cv, "cor", gamma_hat), hi = at_g(cv, "cor", g_hi))
+s_topk <- c(lo = at_g(cv, "topk", g_lo), hat = at_g(cv, "topk", gamma_hat),
+            hi = at_g(cv, "topk", g_hi))
+range_h2 <- c(0.02, 0.9)
+cv_win <- subset(cv, h2 >= range_h2[1] & h2 <= range_h2[2])
+s_topk_range <- range(cv_win$topk) * k_top
+
+# Expected accuracy is highest close to the true value; MSE lowest there.
+h2_best_cor <- ei$h2[which.max(ei$cor)]
+h2_best_mse <- ei$h2[which.min(ei$mse)]
+
+# Direction words below; knitting stops if a rerun changes them.
+stopifnot(
+  iid_cor_loss > 0,
+  iid_cor_loss < sd_cor_base / 2,         # "small next to" the trial-to-trial spread
+  ei_gain["lo"] > 1, ei_gain["hi"] < 1,   # too small: under-promises; too large: over-promises
+  ei_mse["true"] < min(ei_mse[c("lo", "hi")]),
+  abs(h2_best_cor - h2_true) < 0.05, abs(h2_best_mse - h2_true) < 0.05,   # "both close to the true"
+  abs(s_cor["hat"] - s_cor["true"]) < 0.02   # single trial: "slightly" better or worse
+)
+```
+
+Suppose the REML estimate lands in the wrong place. How much does that cost? On the trial of the hill figure we computed the BLUPs at every point of the grid, not just at the peak, and scored each set of predictions against the true genetic values. We then averaged the same curves over all `r n_rep` baseline trials, to see what happens *in expectation* and not just on one dataset.
+
+```{r, fig.align="c", fig.width=12, fig.height=7, echo=FALSE, eval=TRUE}
+ei_win <- subset(ei, h2 >= range_h2[1] & h2 <= range_h2[2])
+lines_df <- bind_rows(
+  cv_win |> transmute(h2, metric = "cor", value = cor, source = "This trial"),
+  cv_win |> transmute(h2, metric = "topk", value = topk, source = "This trial"),
+  cv_win |> transmute(h2, metric = "mse", value = mse, source = "This trial"),
+  cv_win |> transmute(h2, metric = "gain", value = gain_slope, source = "This trial"),
+  ei_win |> transmute(h2, metric = "cor", value = cor, source = "Average of 500 trials"),
+  ei_win |> transmute(h2, metric = "topk", value = topk, source = "Average of 500 trials"),
+  ei_win |> transmute(h2, metric = "mse", value = mse, source = "Average of 500 trials"),
+  ei_win |> transmute(h2, metric = "gain", value = gain_slope, source = "Average of 500 trials")
+) |>
+  mutate(source = factor(source, levels = c("This trial", "Average of 500 trials")))
+stopifnot(attr(ei, "n_rep") == 500)   # the legend label above
+
+marks <- list(
+  geom_vline(xintercept = h2_true, colour = col_ink, linetype = "dashed", linewidth = 0.6),
+  geom_vline(xintercept = h2_hat, colour = col_accent, linewidth = 0.6)
+)
+panel <- function(m, title, ylab, ref = NULL) {
+  p <- ggplot(filter(lines_df, metric == m), aes(h2, value, colour = source)) +
+    marks +
+    geom_line(linewidth = 1) +
+    scale_colour_manual(values = c(col_main, col_third), name = NULL) +
+    labs(title = title, x = expression(h^2 * " used for the BLUPs"), y = ylab) +
+    my_theme + theme(plot.title = element_text(size = 12))
+  if (!is.null(ref)) p <- p + geom_hline(yintercept = ref, colour = col_ink, linewidth = 0.4)
+  p
+}
+p_ll <- ggplot(cv_win, aes(h2, loglik - ll_max)) +
+  marks +
+  geom_line(colour = col_main, linewidth = 1) +
+  labs(title = "Log-likelihood (this trial)", x = expression(h^2 * " used for the BLUPs"),
+       y = "Below the peak") +
+  my_theme + theme(plot.title = element_text(size = 12))
+p_cor <- panel("cor", "Accuracy, cor(predicted, true)", "Correlation")
+p_topk <- panel("topk", "Share of the true top 10% selected", "Share")
+p_mse <- panel("mse", "Mean squared error of the BLUPs", "MSE")
+p_gain <- panel("gain", "Gain slope (1 = predicted gain is right)", "Slope (log scale)", ref = 1) +
+  scale_y_log10()
+
+p_ll + p_cor + p_topk + p_mse + p_gain + guide_area() +
+  plot_layout(ncol = 3, guides = "collect") +
+  plot_annotation(title = "What changes when the variance estimate lands elsewhere",
+                  subtitle = "Dashed line: true h². Orange line: the REML estimate for this trial.",
+                  theme = theme(plot.title = element_text(face = "bold", hjust = 0.5),
+                                plot.subtitle = element_text(hjust = 0.5))) &
+  theme(legend.position = "right")
+```
+
+The x-axis is the heritability plugged into the mixed model equations, from `r fmt(range_h2[1], 2)` to `r fmt(range_h2[2], 1)`. Read the panels as "what if REML had landed here?".
+
+- **Rankings hardly move.** Averaged over trials, the accuracy at the true value is `r fmt(ei_cor["true"])`; a variance ratio `r wrong` times too small gives `r fmt(ei_cor["lo"])`, and `r wrong` times too large gives `r fmt(ei_cor["hi"])`. That loss of at most `r fmt(iid_cor_loss, 3)` is small next to the ordinary trial-to-trial spread of accuracy in this design (standard deviation `r fmt(sd_cor_base, 3)`).
+- **Scale moves a lot.** Over the same range the reported heritability runs from `r fmt(h2_of(g_lo), 2)` to `r fmt(h2_of(g_hi), 2)`, and the gain slope (the slope of the regression of true on predicted values, $g$ on $\hat g$, also called the dispersion or inflation slope) goes from `r fmt(ei_gain["true"], 2)` at the truth to `r fmt(ei_gain["lo"], 2)` and `r fmt(ei_gain["hi"], 2)`. A slope of `r fmt(ei_gain["hi"], 2)` means the selected lines deliver only about `r round(100 * ei_gain["hi"])`% of the gain the BLUPs promise; a slope above 1 means the BLUPs are shrunk too much and under-promise.
+- **The truth wins on average, not on every trial.** Averaged over trials, accuracy and prediction error are best close to the true value. On the single trial of the hill, the REML estimate did `r if (s_cor["hat"] > s_cor["true"]) "slightly better than the truth, by luck" else "slightly worse than the truth"`. That is why every claim in this article is about behaviour across many trials.
+
+<details class="fold">
+<summary>The numbers behind this (prediction error and the single trial)</summary>
+
+The mean squared error of the BLUPs goes from `r fmt(ei_mse["true"])` at the truth to `r fmt(ei_mse["lo"])` and `r fmt(ei_mse["hi"])`. Averaged over trials, accuracy peaks at $h^2$ = `r fmt(h2_best_cor, 2)` and the error is lowest at `r fmt(h2_best_mse, 2)`, both close to the true `r fmt(h2_true, 1)`: BLUP with the true variance components is the best (minimum mean squared error) linear unbiased predictor in expectation (Henderson 1975). On the single trial, the BLUPs at the REML estimate had accuracy `r fmt(s_cor["hat"])` against `r fmt(s_cor["true"])` at the true value, `r if (s_cor["hat"] > s_cor["true"]) "slightly better: on one dataset the estimate can beat the truth by luck" else "slightly worse"`, and the number of true top-10% genotypes among the `r k_top` selected varied by at most `r diff(s_topk_range)` over the whole range shown.
+
+</details>
+
+<div class="plainwords">
+
+**In plain words:** in a simple genotype model, the variance estimate mostly decides *how much* the BLUPs are shrunk, not *in what order* the genotypes come out. When the genotypes have similar replication, which lines you select is robust to a poor estimate. What you report about them is not: heritability, the predicted genetic gain and the error of the predictions all depend directly on where the estimate landed.
+
+</div>
+
+<details class="fold">
+<summary>Try it yourself: move the heritability with a slider</summary>
+
+Drag the slider to move the heritability used for the BLUPs on the trial of the hill figure. The marker shows the log-likelihood (relative to the peak), the accuracy and the gain slope at that value.
+
+```{r, echo=FALSE, eval=TRUE, fig.width=8, fig.height=7}
+w_idx <- which(cv$h2 >= range_h2[1] & cv$h2 <= range_h2[2])
+w_idx <- w_idx[seq(1, length(w_idx), by = 2)]
+wd <- cv[w_idx, ]
+wd$ll_rel <- wd$loglik - ll_max
+start_i <- which.min(abs(wd$h2 - h2_hat))
+
+panel_ly <- function(y, name, ylab, ylog = FALSE) {
+  p <- plotly::plot_ly(wd, x = ~h2)
+  p <- plotly::add_lines(p, y = y, name = name, line = list(color = col_main, width = 2),
+                         hoverinfo = "x+y")
+  p <- plotly::add_markers(p, x = wd$h2[start_i], y = y[start_i], name = name,
+                           marker = list(color = col_accent, size = 11), hoverinfo = "x+y")
+  ax <- list(title = ylab, type = if (ylog) "log" else "linear")
+  if (ylog) {
+    ax$tickvals <- c(0.3, 0.5, 1, 2, 5, 10)
+    ax$ticktext <- c("0.3", "0.5", "1", "2", "5", "10")
+  }
+  plotly::layout(p, yaxis = ax)
+}
+fig <- plotly::subplot(
+  panel_ly(wd$ll_rel, "log-likelihood", "logL below peak"),
+  panel_ly(wd$cor, "accuracy", "Accuracy"),
+  panel_ly(wd$gain_slope, "gain slope", "Gain slope", ylog = TRUE),
+  nrows = 3, shareX = TRUE, titleY = TRUE
+)
+step_title <- function(i) {
+  sprintf("h² = %.2f   |   logL %.1f below the peak   |   accuracy %.3f   |   gain slope %.2f",
+          wd$h2[i], abs(wd$ll_rel[i]), wd$cor[i], wd$gain_slope[i])
+}
+steps <- lapply(seq_len(nrow(wd)), function(i) {
+  list(method = "update",
+       label = formatC(wd$h2[i], format = "f", digits = 2),
+       args = list(list(x = list(list(wd$h2[i]), list(wd$h2[i]), list(wd$h2[i])),
+                        y = list(list(wd$ll_rel[i]), list(wd$cor[i]), list(wd$gain_slope[i]))),
+                   list(title = list(text = step_title(i), font = list(size = 13))),
+                   list(1, 3, 5)))
+})
+plotly::layout(
+  fig,
+  showlegend = FALSE,
+  title = list(text = step_title(start_i), font = list(size = 13)),
+  xaxis = list(title = "h² used for the BLUPs"),
+  margin = list(t = 60),
+  sliders = list(list(active = start_i - 1, steps = steps,
+                      currentvalue = list(prefix = "h² = ", font = list(color = col_ink)),
+                      font = list(color = "rgba(0,0,0,0)"), minorticklen = 0,
+                      pad = list(t = 50)))
+) |>
+  plotly::config(displayModeBar = FALSE)
+```
+
+</details>
+
+<details class="fold">
+<summary>Under the hood: why rankings barely move</summary>
+
+When every genotype has the same number of plots $r$, the BLUP of genotype $i$ is $\hat{g}_i = \frac{r}{r+\lambda}(\bar{y}_i - \bar{y})$: every genotype's deviation from the trial mean is multiplied by the same factor. A different $\lambda$ changes that factor, but not the order of the genotypes, so in a balanced trial the correlation and the top-10% list do not depend on the variance estimate at all (as long as it is above zero). With partial replication the factor $r_i/(r_i+\lambda)$ differs between genotypes with one and two plots, and the GLS mean depends on $\lambda$ too, so rankings can move a little, which is why our designs are partially replicated. The loss is also *second order*: near the true value, the expected error of the BLUPs grows with the square of the distance from it, which is why the curves are so flat around the truth.
+
+</details>
+
+#### When genotypes are related: rankings move too
+
+```{r, echo=FALSE}
+kin_s <- SETTINGS$kinship
+ek3 <- res$exp_kin[["h2_0.3"]]; ek1 <- res$exp_kin[["h2_0.1"]]
+g0_k3 <- attr(ek3, "gamma_true"); g0_k1 <- attr(ek1, "gamma_true")
+stopifnot(isTRUE(all.equal(h2_of(g0_k3), kin_s$h2[1])), isTRUE(all.equal(h2_of(g0_k1), kin_s$h2[2])))
+k_at <- function(d, col, g0) c(lo = at_g(d, col, g0 / wrong), true = at_g(d, col, g0),
+                              hi = at_g(d, col, g0 * wrong))
+k3_cor <- k_at(ek3, "cor", g0_k3); k1_cor <- k_at(ek1, "cor", g0_k1)
+k3_topk <- k_at(ek3, "topk", g0_k3); k1_topk <- k_at(ek1, "topk", g0_k1)
+k3_loss <- max(k3_cor["true"] - k3_cor[c("lo", "hi")])
+k1_loss <- max(k1_cor["true"] - k1_cor[c("lo", "hi")])
+
+# How far REML estimates of gamma wander in the (iid) baseline design: middle 90%.
+# Boundary fits have log gamma_hat = -Inf; they are kept (they are estimates
+# too) and are fewer than 5%, so both quantiles below are finite.
+b_int <- res$baseline$log_gamma_hat
+stopifnot(mean(is.infinite(b_int)) < 0.05)
+ratio_90 <- exp(quantile(b_int, c(0.05, 0.95)) - log(g0))
+stopifnot(all(is.finite(ratio_90)))
+
+# Kinship accuracy at the multiples of the true ratio that bound the middle 90%
+# of the baseline estimates.
+k3_at90 <- at_g(ek3, "cor", g0_k3 * ratio_90)
+iid_at90 <- at_g(ei, "cor", g0 * ratio_90)
+
+# "rankings move" / "many times": the kinship losses are far above the iid loss.
+stopifnot(k3_loss > 5 * iid_cor_loss, k1_loss > 5 * iid_cor_loss, k3_loss > sd_cor_base / 2,
+          all(k3_cor["true"] - k3_at90 > ei_cor["true"] - iid_at90),
+          all(k3_topk[c("lo", "hi")] < k3_topk["true"]),            # top-10% share "falls"
+          # realistic errors: "smaller losses than at a factor of 10"
+          max(k3_cor["true"] - k3_at90) < min(k3_cor["true"] - k3_cor[c("lo", "hi")]))
+
+# Family structure of G: mean off-diagonal relationship within and between
+# the families of make_kinship().
+G_kin <- .kinship_G()
+fam_kin <- ceiling(seq_len(nrow(G_kin)) * kin_s$n_family / nrow(G_kin))
+same_fam <- outer(fam_kin, fam_kin, "==")
+G_within <- mean(G_kin[same_fam & row(G_kin) != col(G_kin)])
+G_between <- mean(G_kin[!same_fam])
+
+# Robustness checks (scripts/robustness_checks.R): the first trials of the
+# kinship experiment, and an uneven-replication design, with BLUPs at the true
+# variance ratio, 10 times off, and at the REML estimate.
+rob <- res$robust
+rob_n <- attr(rob, "n_rep")
+rob_mean <- function(chk, col) {
+  d <- rob[rob$check == chk & !rob$degenerate, ]
+  sapply(c("lo", "true", "hi", "reml"), function(p) mean(d[[col]][d$point == p]))
+}
+rob_loss <- function(x) max(x["true"] - x[c("lo", "hi")])
+rk3 <- lapply(c(all = "cor", within = "cor_within", between = "cor_between"),
+              function(col) rob_mean("kinship_0.3", col))
+rk1 <- lapply(c(all = "cor", within = "cor_within", between = "cor_between"),
+              function(col) rob_mean("kinship_0.1", col))
+ru_cor <- rob_mean("uneven", "cor"); rb_cor <- rob_mean("baseline", "cor")
+ru_high <- rob_mean("uneven", "n_high_in_top")
+ru_loss <- rob_loss(ru_cor); rb_loss <- rob_loss(rb_cor)
+ru_reps <- attr(rob, "uneven_rep_counts")
+ru_r <- max(ru_reps); ru_n_hi <- sum(ru_reps == ru_r); ru_n_1 <- sum(ru_reps == 1)
+ru_n_boundary <- length(unique(rob$rep[rob$check == "uneven" & rob$boundary]))
+ru_h2 <- unique(rob$h2[rob$check == "uneven"])
+stopifnot(
+  all(is.na(rob$error)), attr(rob, "wrong") == wrong,
+  isTRUE(all.equal(c(G_within, G_between), c(attr(rob, "G_within"), attr(rob, "G_between")))),
+  G_within > 0.3, G_between < 0,                  # "strong family structure"
+  # "much of the loss is in ranking genotypes from different families":
+  # within families the loss is less than half of the overall loss, and the
+  # order of the family means hardly changes.
+  rob_loss(rk3$within) < rob_loss(rk3$all) / 2, rob_loss(rk1$within) < rob_loss(rk1$all) / 2,
+  rob_loss(rk3$between) < rob_loss(rk3$all) / 2, rob_loss(rk1$between) < rob_loss(rk1$all) / 2,
+  # Uneven replication: "several times" the loss of the baseline design, and
+  # closer (as a ratio) to the relationship-model loss than to the
+  # independent-genotype loss, i.e. "more like the relationship model".
+  ru_loss > 3 * rb_loss, ru_loss > 3 * iid_cor_loss, ru_loss^2 > iid_cor_loss * k3_loss,
+  # Too small a ratio puts more of the many-plot genotypes in the top 10%,
+  # too large a ratio fewer.
+  ru_high["lo"] > ru_high["true"], ru_high["true"] > ru_high["hi"],
+  # "REML itself ... costs little here"
+  ru_cor["true"] - ru_cor["reml"] < ru_loss / 3
+)
+```
+
+Breeding programs increasingly predict genetic values with a relationship matrix: pedigree-based, or genomic (GBLUP) from markers. To see whether the conclusion survives, we repeated the experiment with genotypes related through a genomic relationship matrix $G$ (VanRaden 2008), at heritabilities `r fmt(kin_s$h2[1], 1)` and `r fmt(kin_s$h2[2], 1)`, with `r n_rep` trials each.
+
+<details class="fold">
+<summary>How the relationship-model simulation was set up</summary>
+
+We simulated `r length(kin_s$rep_counts)` genotypes from `r kin_s$n_family` families of `r length(kin_s$rep_counts) / kin_s$n_family` and built a genomic relationship matrix $G$ from `r kin_s$n_snp` simulated markers with the method of VanRaden (2008). $G$ was scaled to mean diagonal 1 (plus `r kin_s$ridge` on the diagonal so it can be inverted), so $\sigma^2_g$ is still the genetic variance of a genotype and the heritabilities below are true heritabilities. The genetic values were drawn from $N(0, \sigma^2_g G)$, the field design is the baseline one, and the model is the same as before with $g \sim N(0, \sigma^2_g G)$.
+
+</details>
+
+```{r, fig.align="c", fig.width=10, fig.height=4.5, echo=FALSE, eval=TRUE}
+rel_curve <- function(d, label) {
+  g0d <- attr(d, "gamma_true")
+  d |>
+    mutate(ratio = exp(log_gamma) / g0d,
+           d_cor = cor - at_g(d, "cor", g0d),
+           d_topk = topk - at_g(d, "topk", g0d),
+           model = label) |>
+    filter(ratio >= 1 / 30, ratio <= 30)
+}
+rel_df <- bind_rows(
+  rel_curve(ei, paste0("Independent genotypes, h² = ", fmt(SETTINGS$baseline$h2, 1))),
+  rel_curve(ek3, paste0("Relationship matrix G, h² = ", fmt(kin_s$h2[1], 1))),
+  rel_curve(ek1, paste0("Relationship matrix G, h² = ", fmt(kin_s$h2[2], 1)))
+) |>
+  mutate(model = factor(model, levels = unique(model)))
+rel_long <- rel_df |>
+  select(ratio, model, d_cor, d_topk) |>
+  pivot_longer(c(d_cor, d_topk), names_to = "metric") |>
+  mutate(metric = recode(metric, d_cor = "Change in accuracy, cor(predicted, true)",
+                         d_topk = "Change in share of the true top 10% selected"))
+ggplot(rel_long, aes(ratio, value, colour = model)) +
+  geom_hline(yintercept = 0, colour = col_ink, linewidth = 0.4) +
+  geom_vline(xintercept = 1, colour = col_ink, linetype = "dashed", linewidth = 0.5) +
+  geom_line(linewidth = 1) +
+  scale_x_log10(breaks = c(1/30, 1/10, 1/3, 1, 3, 10, 30),
+                labels = c("1/30", "1/10", "1/3", "1", "3", "10", "30")) +
+  scale_colour_manual(values = c(col_ink, col_main, col_accent), name = NULL) +
+  facet_wrap(~ metric, scales = "free_y") +
+  labs(title = "Average cost of a wrong variance ratio",
+       x = "Variance ratio used, as a multiple of the true one",
+       y = "Change from the true value") +
+  guides(colour = guide_legend(nrow = 2)) +
+  my_theme
+```
+
+With related genotypes the curves are no longer flat. At $h^2$ = `r fmt(kin_s$h2[1], 1)`, the average accuracy is `r fmt(k3_cor["true"])` at the true value, `r fmt(k3_cor["lo"])` with a variance ratio `r wrong` times too small and `r fmt(k3_cor["hi"])` with one `r wrong` times too large, and the share of the true top 10% selected falls as well. These losses, up to `r fmt(k3_loss, 3)` at $h^2$ = `r fmt(kin_s$h2[1], 1)` and `r fmt(k1_loss, 3)` at $h^2$ = `r fmt(kin_s$h2[2], 1)`, are many times the `r fmt(iid_cor_loss, 3)` of the independent-genotype model. With realistic errors instead of a factor of `r wrong` (shown at $h^2$ = `r fmt(kin_s$h2[1], 1)` in the fold below), the losses are smaller, but still larger than with independent genotypes. This is one genomic $G$ with strong family structure (mean relationship `r fmt(G_within, 2)` within families and `r sub("^-", "&minus;", fmt(G_between, 2))` between them), and much of the loss is in ranking genotypes from different families against each other: within a family the order changed much less.
+
+<details class="fold">
+<summary>The numbers behind this (top-10% share, families, and realistic errors)</summary>
+
+At $h^2$ = `r fmt(kin_s$h2[1], 1)` the share of the true top 10% selected falls from `r fmt(k3_topk["true"], 2)` at the true value to `r fmt(k3_topk["lo"], 2)` and `r fmt(k3_topk["hi"], 2)`. At $h^2$ = `r fmt(kin_s$h2[2], 1)` the accuracy goes from `r fmt(k1_cor["true"])` to `r fmt(k1_cor["lo"])` and `r fmt(k1_cor["hi"])`.
+
+A factor of `r wrong` is a large error, so how large are realistic ones? In the baseline design with independent genotypes, the middle 90% of the REML estimates of the variance ratio ranged from `r fmt(ratio_90[1], 2)` to `r fmt(ratio_90[2], 1)` times the true value (Myth 3 looks at this spread). In the relationship model at $h^2$ = `r fmt(kin_s$h2[1], 1)`, using those two multiples gives an average accuracy of `r fmt(k3_at90[1])` and `r fmt(k3_at90[2])`, against `r fmt(k3_cor["true"])` at the truth: smaller losses than at a factor of `r wrong`, but still larger than in the independent model (`r fmt(iid_at90[1])` and `r fmt(iid_at90[2])` against `r fmt(ei_cor["true"])`).
+
+Where is the loss? We repeated the relationship model on the first `r rob_n` trials at each heritability (`scripts/robustness_checks.R`) and split the accuracy in two: within families (the mean of the `r kin_s$n_family` within-family correlations between predicted and true values) and between families (the correlation between predicted and true family means). At $h^2$ = `r fmt(kin_s$h2[1], 1)`, the overall accuracy on these trials was `r fmt(rk3$all["true"])` at the true value and `r fmt(rk3$all["lo"])` and `r fmt(rk3$all["hi"])` at a ratio `r wrong` times too small and too large. Within families it was `r fmt(rk3$within["true"])`, against `r fmt(rk3$within["lo"])` and `r fmt(rk3$within["hi"])`, and between families `r fmt(rk3$between["true"])`, against `r fmt(rk3$between["lo"])` and `r fmt(rk3$between["hi"])`. At $h^2$ = `r fmt(kin_s$h2[2], 1)`: overall `r fmt(rk1$all["true"])` against `r fmt(rk1$all["lo"])` and `r fmt(rk1$all["hi"])`; within families `r fmt(rk1$within["true"])` against `r fmt(rk1$within["lo"])` and `r fmt(rk1$within["hi"])`; between families `r fmt(rk1$between["true"])` against `r fmt(rk1$between["lo"])` and `r fmt(rk1$between["hi"])`. Neither the order within a family nor the order of the family means moves much. What moves is the weight a genotype's own plots get against its family's mean, and so how genotypes from different families are placed against each other. A relationship matrix with weaker family structure, or a pedigree, may behave differently; we did not simulate one.
+
+</details>
+
+<div class="plainwords">
+
+**In plain words:** with a relationship matrix, a genotype's BLUP combines two sources of information: its own plots and the plots of its relatives. The variance ratio decides how much weight each source gets. A genotype with two plots and few close relatives and a genotype with one plot and many close relatives are affected differently when that weight changes, so their order can swap. In the independent model, the only information about a genotype is its own plots (compared with the trial mean), and the variance ratio mostly just scales it.
+
+</div>
+
+**Very uneven replication moves rankings too.** In a trial where `r ru_n_hi` genotypes have `r ru_r` plots and the other `r ru_n_1` one plot each, as in augmented designs or unbalanced multi-environment data, a variance ratio `r wrong` times off cost up to `r fmt(ru_loss, 3)` in average accuracy, several times the `r fmt(iid_cor_loss, 3)` of our baseline design: this behaves more like the relationship model than like the independent model with similar replication. The order among genotypes with the same number of plots does not change at all (they share one shrinkage factor); what moves is how the well-replicated genotypes are placed against the rest, which matters when both are selection candidates rather than checks.
+
+<details class="fold">
+<summary>The numbers behind this (the uneven-replication check)</summary>
+
+`scripts/robustness_checks.R` simulated `r rob_n` trials with `r ru_n_hi` genotypes in `r ru_r` plots and `r ru_n_1` in one (`r sum(ru_reps)` plots, $h^2$ = `r fmt(ru_h2, 1)`, independent genotypes, otherwise as the baseline design). The average accuracy was `r fmt(ru_cor["true"])` at the true variance ratio, `r fmt(ru_cor["lo"])` with a ratio `r wrong` times too small and `r fmt(ru_cor["hi"])` with one `r wrong` times too large. On the same `r rob_n` seeds the baseline design gave `r fmt(rb_cor["true"])`, `r fmt(rb_cor["lo"])` and `r fmt(rb_cor["hi"])`. At the REML estimate the uneven design averaged `r fmt(ru_cor["reml"])` (leaving out `r ru_n_boundary` boundary `r if (ru_n_boundary == 1) "fit" else "fits"`), so REML itself, landing near the truth on average, costs little here.
+
+The reason is the shrinkage. A genotype with `r ru_r` plots is shrunk little whatever the variance ratio; a genotype with one plot is shrunk a lot, and by how much depends on the ratio. With the ratio too small, the single-plot genotypes are shrunk too hard and the well-replicated ones take more of the top 10%: on average `r fmt(ru_high["lo"], 1)` of the `r k_top` selected, against `r fmt(ru_high["true"], 1)` at the true ratio and `r fmt(ru_high["hi"], 1)` with the ratio too large.
+
+</details>
+
+<div class="takeaway">
+
+**Takeaway for breeders**
+
+- In a simple genotype model where genotypes have similar replication, rankings are robust to where the variance estimate lands: a variance ratio `r wrong` times off cost at most `r fmt(iid_cor_loss, 3)` in average accuracy.
+- Heritability, predicted genetic gain and the error of the BLUPs are not robust. They move directly with the estimate.
+- With relationships among genotypes (in our simulations, one genomic $G$ with strong family structure), rankings move too: the same error cost up to `r fmt(max(k3_loss, k1_loss), 3)` in accuracy, much of it in ranking genotypes from different families against each other. Very uneven replication moves rankings too (up to `r fmt(ru_loss, 3)`).
+- The true variance components give the best predictions on average, but a single trial can do better or worse by luck.
+
+</div>
+
+### Myth 3: All trials are equally trustworthy
+
+```{r, echo=FALSE}
+q90 <- function(x) quantile(x, c(0.05, 0.95), na.rm = TRUE, names = FALSE)
+rng_txt <- function(x, d = 2) paste0(fmt(x[1], d), " to ", fmt(x[2], d))
+z95 <- qnorm(0.975)
+
+m3 <- lapply(names(designs), function(sc) {
+  d <- res[[sc]]
+  d <- d[is.na(d$error), ]
+  lg0 <- log(SETTINGS[[sc]]$h2 / (1 - SETTINGS[[sc]]$h2))
+  interior <- !d$boundary
+  # Curvature: only interior fits with a usable (positive) value. The runner
+  # already set it to NA at the boundary and where it came out <= 0.
+  usable <- interior & is.finite(d$info_log_gamma) & d$info_log_gamma > 0
+  se <- d$info_log_gamma[usable]^-0.5
+  covered <- abs(d$log_gamma_hat[usable] - lg0) < z95 * se
+  # The same curvature on the h2 scale (delta method, exact at the peak):
+  # SE(h2) = SE(log gamma) * dh2/dlog gamma = SE(log gamma) * h2 (1 - h2).
+  h2u <- d$h2_hat[usable]
+  se_h2 <- se * h2u * (1 - h2u)
+  h2_0 <- SETTINGS[[sc]]$h2
+  covered_h2 <- abs(h2u - h2_0) < z95 * se_h2
+  below0 <- h2u - z95 * se_h2 < 0
+  # Profile-likelihood intervals for every trial (scripts/profile_coverage.R).
+  pc <- res$prof[res$prof$scenario == sc, ]
+  stopifnot(nrow(pc) == nrow(d), all(is.na(pc$error)),
+            identical(pc$h2_hat, d$h2_hat[match(pc$rep, d$rep)]),
+            identical(pc$boundary, d$boundary[match(pc$rep, d$rep)]))
+  pc_int <- pc$covered[!pc$boundary]
+  list(n_prof = nrow(pc), prof_cover = mean(pc$covered), n_prof_cover = sum(pc$covered),
+       prof_cover_int = mean(pc_int), n_prof_int = length(pc_int),
+       cover_h2_int = mean(covered_h2), cover_h2_all = sum(covered_h2) / nrow(d),
+       n_below0 = sum(below0), p_below0 = mean(below0),
+       se_h2_med = median(se_h2), se_h2_90 = q90(se_h2),
+       prof_zero = sum(pc$reaches_zero), prof_hi_med = median(pc$h2_hi),
+       prof_split = sum(pc$pieces > 1),
+       n = nrow(d), n_boundary = sum(d$boundary), n_interior = sum(interior),
+       n_unusable = sum(interior & !usable),
+       h2_90 = q90(d$h2_hat), gain_90 = q90(d$gain_slope),
+       rel_90 = q90(d$reliability), cor_90 = q90(d$cor),
+       sd_lg = sd(d$log_gamma_hat[interior]),
+       se_med = median(se), se_90 = q90(se),
+       cover_int = mean(covered), n_cover = sum(covered), n_usable = sum(usable),
+       cover_all = sum(covered) / nrow(d),
+       mean_dcor = mean(d$d_cor, na.rm = TRUE))
+})
+names(m3) <- names(designs)
+mw <- m3$weak; mb <- m3$baseline; ms <- m3$strong
+
+# Direction words below; knitting stops if a rerun changes them.
+stopifnot(
+  diff(mw$h2_90) > diff(ms$h2_90), diff(mb$h2_90) > diff(ms$h2_90),
+  diff(mw$gain_90) > diff(mb$gain_90), diff(mb$gain_90) > diff(ms$gain_90),
+  abs(ms$se_med / ms$sd_lg - 1) < 0.1,          # strong: curvature matches the spread
+  mw$cover_int < mb$cover_int, mb$cover_int < ms$cover_int,
+  # Interior fits share one denominator on both scales and for the profile.
+  all(sapply(m3, function(s) s$n_prof_int == s$n_usable)),
+  # "depend on the scale": in the weak design the two curvature intervals
+  # differ in coverage by more than simulation noise (5 points).
+  abs(mw$cover_h2_int - mw$cover_int) > 0.05,
+  mw$n_boundary > 0,                            # weak: boundary fits "have no interval"
+  all(res$prof$h2_lo >= 0),                     # profile: "never goes below zero"
+  mw$p_below0 > 0.5,                            # weak, h2 scale: "usually" reaches below zero
+  ms$n_below0 == 0,                             # strong: never
+  # Profile interval "has none of these problems": above both curvature
+  # intervals on all trials and on interior fits in the weak design.
+  mw$prof_cover > max(mw$cover_all, mw$cover_h2_all),
+  mw$prof_cover_int >= max(mw$cover_int, mw$cover_h2_int),
+  abs(ms$cover_h2_int - 0.95) < 0.025,          # strong, h2 scale: "close to the nominal 95%"
+  # The log-scale SE swings far more than the h2-scale SE in the weak design.
+  mw$se_90[2] / mw$se_90[1] > 5 * mw$se_h2_90[2] / mw$se_h2_90[1],
+  mw$se_90[2] / mw$se_90[1] > 5 * ms$se_90[2] / ms$se_90[1],
+  diff(sqrt(mw$rel_90)) > diff(mw$cor_90),      # reliability swings more than realized accuracy
+  mb$mean_dcor < 0, mw$mean_dcor < 0,           # "lost on average"
+  # Profile intervals: at or above nominal, up to simulation noise (binomial
+  # 95% CI reaches 0.95), in every design, and clearly better than the
+  # curvature intervals (all trials) in the weak and baseline designs.
+  all(sapply(m3, `[[`, "prof_cover") > 0.93),
+  all(sapply(m3, function(s) binom.test(s$n_prof_cover, s$n_prof)$conf.int[2] >= 0.95)),
+  mw$prof_cover - mw$cover_all > 0.2, mb$prof_cover > mb$cover_all,
+  mw$prof_cover - mw$cover_h2_all > 0.2, mb$prof_cover > mb$cover_h2_all,
+  abs(ms$prof_cover - ms$cover_all) < 0.02,
+  all(sapply(m3, `[[`, "prof_split") == 0),
+  mw$prof_zero > mw$n / 2,                      # "most weak intervals reach zero"
+  all(abs(log(ms$gain_90)) < log(1.25)),        # strong: gain slope "close to 1"
+  mw$gain_90[1] < 0.5, mw$gain_90[2] > 2,       # weak: "a large factor in either direction"
+  abs(mb$mean_dcor) < 0.005, abs(mw$mean_dcor) < 0.005,   # rankings "pay almost nothing"
+  abs(ms$cover_int - 0.95) < 0.025              # strong: "close to the nominal 95%"
+)
+```
+
+Every number so far came from a single variance estimate per trial. But the hill can be sharp or flat, and that decides how far the estimate wanders from trial to trial. We return to the weak, baseline and strong designs of Myth 1, `r n_rep` trials of each.
+
+#### How far the estimate wanders
+
+```{r, fig.align="c", fig.width=11, fig.height=4.5, echo=FALSE, eval=TRUE}
+m3_df <- bind_rows(lapply(names(designs), function(sc) {
+  res[[sc]] |>
+    filter(is.na(error)) |>
+    mutate(design = factor(designs[[sc]], levels = designs),
+           h2_true = SETTINGS[[sc]]$h2)
+}))
+lab_df <- data.frame(design = factor(designs, levels = designs),
+                     n_b = sapply(m3, `[[`, "n_boundary"))
+p_h2 <- ggplot(m3_df, aes(h2_hat)) +
+  geom_histogram(binwidth = 0.02, boundary = 0, fill = col_main, alpha = 0.8) +
+  geom_vline(aes(xintercept = h2_true), colour = col_ink, linetype = "dashed") +
+  geom_text(data = lab_df, aes(x = 0.6, y = Inf, label = paste0(n_b, " trials at h² = 0")),
+            hjust = 1, vjust = 1.5, colour = col_accent, size = 3.6) +
+  facet_wrap(~ design, ncol = 1) +
+  labs(title = "REML estimates of heritability", x = expression(hat(h)^2), y = "Trials") +
+  my_theme
+p_gain <- ggplot(filter(m3_df, !degenerate), aes(design, gain_slope)) +
+  geom_hline(yintercept = 1, colour = col_ink, linewidth = 0.4) +
+  geom_boxplot(fill = col_main, alpha = 0.3, colour = col_main, outlier.alpha = 0.3,
+               width = 0.5) +
+  scale_y_log10() +
+  labs(title = "Gain slope of the BLUPs", x = NULL, y = "Slope (log scale)") +
+  my_theme
+p_h2 + p_gain + plot_layout(widths = c(1.3, 1))
+```
+
+In the strong design the hill is sharp: in 90% of the trials the heritability estimate was in the range `r rng_txt(ms$h2_90)` (true value `r fmt(rst$h2, 1)`), and the gain slope stays close to 1. In the weak design, estimates run from `r rng_txt(mw$h2_90)` around a true `r fmt(rw$h2, 1)`, and the gain slope from `r rng_txt(mw$gain_90)`: in a weak trial, the predicted genetic gain can be wrong by a large factor in either direction. The model's own reliability is no safer guide: in the weak design, the accuracy it claims varied more from trial to trial than the realized accuracy did, and it ignores the uncertainty in the variance components themselves (Kackar and Harville 1984).
+
+Among the trials where REML found some genetic variance, rankings pay almost nothing for this wandering, as Myth 2 predicts for independent genotypes with similar replication: compared with BLUPs at the true variance components, the plug-in BLUPs lost on average `r fmt(-mb$mean_dcor, 4)` in accuracy in the baseline design and `r fmt(-mw$mean_dcor, 4)` in the weak design. Boundary fits, which give no ranking at all, are not in that average; we come to them next.
+
+<details class="fold">
+<summary>The numbers behind this (full table, ranges and caveats)</summary>
+
+```{r, echo=FALSE}
+row_m3 <- c(
+  "Trials",
+  "Estimate at the boundary (genetic variance = 0)",
+  "Heritability estimate, middle 90%",
+  "Gain slope, middle 90%",
+  "Model's own reliability, middle 90%",
+  "Realized accuracy, cor(predicted, true), middle 90%",
+  "SD of log variance ratio across trials (interior fits)",
+  "SE of log variance ratio from the curvature, median (middle 90%)",
+  "SE of h² from the curvature, median (middle 90%)",
+  "Curvature 95% interval on log variance ratio covers the truth",
+  "Curvature 95% interval on h² covers the truth",
+  "Curvature interval on h² reaches below 0",
+  "Profile-likelihood 95% interval covers the truth",
+  "Profile-likelihood interval reaches h² = 0"
+)
+col_m3 <- function(s) c(
+  s$n,
+  paste0(s$n_boundary, " (", pct(s$n_boundary / s$n), ")"),
+  rng_txt(s$h2_90), rng_txt(s$gain_90), rng_txt(s$rel_90), rng_txt(s$cor_90),
+  fmt(s$sd_lg, 2),
+  paste0(fmt(s$se_med, 2), " (", rng_txt(s$se_90), ")"),
+  paste0(fmt(s$se_h2_med, 2), " (", rng_txt(s$se_h2_90), ")"),
+  paste0(pct(s$cover_int), " of ", s$n_usable, " interior fits; ",
+         pct(s$cover_all), " of all ", s$n),
+  paste0(pct(s$cover_h2_int), " of ", s$n_usable, " interior fits; ",
+         pct(s$cover_h2_all), " of all ", s$n),
+  paste0(s$n_below0, " of ", s$n_usable, " interior fits"),
+  paste0(pct(s$prof_cover_int), " of ", s$n_prof_int, " interior fits; ",
+         pct(s$prof_cover), " of all ", s$n_prof),
+  paste0(s$prof_zero, " of ", s$n_prof)
+)
+data.frame(Quantity = row_m3,
+           Weak = col_m3(mw), Baseline = col_m3(mb), Strong = col_m3(ms),
+           check.names = FALSE) |>
+  kable(align = c("l", "r", "r", "r"))
+```
+
+In the strong design the gain slope ranged over `r rng_txt(ms$gain_90)` (middle 90%). In the baseline design the middle 90% of heritability estimates spans `r rng_txt(mb$h2_90)` around a true `r fmt(rbase$h2, 1)`, and the gain slope `r rng_txt(mb$gain_90)`. The model's own reliability, computed from the prediction error variances at the estimated variance components, ranged over `r rng_txt(mw$rel_90)` in the weak design, which claims an accuracy (its square root) of `r rng_txt(sqrt(mw$rel_90))`, while the realized accuracy only ranged over `r rng_txt(mw$cor_90)`.
+
+The average loss in accuracy leaves out the boundary fits (`r mb$n_boundary` baseline and `r mw$n_boundary` weak trials). We did not run this replicate study for the relationship model, but its curves in Myth 2 are not flat, so there we would expect the wandering to cost accuracy as well.
+
+</details>
+
+#### Boundary fits: when REML says "no genetic variance"
+
+In `r mw$n_boundary` of the `r mw$n` weak trials (`r pct(mw$n_boundary / mw$n)`), the top of the hill was at $h^2$ = 0: REML set the genetic variance to exactly zero, although every one of those trials was simulated with a true $h^2$ of `r fmt(rw$h2, 1)`. This also happened in `r mb$n_boundary` baseline trials and `r if (ms$n_boundary == 0) "in none of the strong trials" else paste(ms$n_boundary, "strong trials")`. A boundary fit does not mean "there is no genetic variance"; it means this trial cannot tell the genetic variance apart from zero. The consequences are severe: every BLUP is zero, so the model ranks nothing, and a reported heritability of zero says nothing about how large the genetic variance could be (the profile-likelihood interval below does). If the entries of such a trial must still be ranked, the usual fallback is to fit genotype as a fixed effect and rank its estimated means (BLUEs). Count boundary fits and report them. They say this trial could not separate genetic variance from noise, not that genetic variance is absent.
+
+#### The width of the hill
+
+```{r, echo=FALSE}
+# Hills of the first trial (replicate 1) of each design: curvature-based
+# (Wald) interval vs profile-likelihood interval, both nominal 95%.
+hill_one <- function(sc) {
+  s <- SETTINGS[[sc]]
+  seed <- BASE_SEED + 1
+  des <- make_design(s$rep_counts, seed = seed)
+  sim <- simulate_trial(des, h2 = s$h2, seed = seed)
+  dm <- design_matrices(des)
+  su <- reml_setup(sim$y, dm$X, dm$Z)
+  fit <- reml_fit(su)
+  stopifnot(isTRUE(all.equal(fit$loglik, res[[sc]]$loglik_max[1], tolerance = 1e-8)))
+  h2g <- seq(0, 0.98, by = 0.002)
+  ll <- reml_loglik(h2g / (1 - h2g), su) - fit$loglik
+  inside <- h2g[ll >= -drop_95]
+  se <- fit$info_log_gamma^-0.5
+  w <- exp(log(fit$gamma) + c(-1, 1) * z95 * se)
+  list(curve = data.frame(design = designs[[sc]], h2 = h2g, ll = ll),
+       h2_hat = fit$h2, h2_true = s$h2, boundary = fit$boundary,
+       prof = range(inside), wald = h2_of(w),
+       wald_h2 = fit$h2 + c(-1, 1) * z95 * se * fit$h2 * (1 - fit$h2), ll0 = ll[1])
+}
+hills <- lapply(setNames(names(designs), names(designs)), hill_one)
+stopifnot(!any(sapply(hills, `[[`, "boundary")))
+hw <- hills$weak; hs <- hills$strong
+inside_iv <- function(iv, x) iv[1] <= x && x <= iv[2]
+stopifnot(max(abs(hs$prof - hs$wald)) < 0.02,   # strong: "almost coincide"
+          max(abs(hs$prof - hs$wald_h2)) < 0.02,
+          max(abs(hw$prof - hw$wald)) > 0.03,   # weak: "they disagree"
+          max(abs(hw$prof - hw$wald_h2)) > 0.03)
+# Which of the weak trial's three intervals contain the true value.
+hw_in <- c(profile = inside_iv(hw$prof, hw$h2_true), log = inside_iv(hw$wald, hw$h2_true),
+           h2 = inside_iv(hw$wald_h2, hw$h2_true))
+stopifnot(any(hw_in))
+```
+
+How sharp is the hill? The standard answer is its *curvature* at the peak. The standard errors that mixed-model software reports for variance components come from this kind of curvature (the information matrix), and the usual "estimate ± 2 SE" interval assumes the hill is shaped like an upside-down parabola *on the scale where the SE was computed*. The same curvature gives different intervals on different scales, so we built it on two: the log of the variance ratio, $\log\gamma$, and $h^2$ itself, the scale a breeder reports.
+
+<details class="fold">
+<summary>Under the hood: curvature-based and profile-likelihood intervals</summary>
+
+On the scale of $\log\gamma$, the observed information is the curvature of the profile log-likelihood at its peak, $J = -\partial^2 \ell / \partial(\log\gamma)^2$, and the curvature-based standard error is $\text{SE}(\log\hat\gamma) \approx J^{-1/2}$. The curvature-based 95% interval on that scale is $\log\hat\gamma \pm `r fmt(z95, 2)`\,J^{-1/2}$, which, mapped to $h^2$, is lopsided and never reaches below zero. On the $h^2$ scale, with $h^2 = \gamma/(1+\gamma)$ and so $dh^2/d\log\gamma = h^2(1-h^2)$, the same curvature gives $\text{SE}(\hat h^2) \approx \hat h^2(1-\hat h^2)\,J^{-1/2}$ (the delta method, exact for the curvature at the peak) and the symmetric interval $\hat h^2 \pm `r fmt(z95, 2)`\,\text{SE}(\hat h^2)$, which can. Software often reports the SE of $\hat\sigma^2_g$ itself, a third scale. At a boundary fit there is no curvature at the peak, so neither interval exists. The profile-likelihood interval instead keeps every value whose log-likelihood is within `r fmt(drop_95, 2)` units of the peak (half the 95% quantile of $\chi^2_1$), the shaded band of the first hill figure. The profile interval is the same on every scale. The intervals agree when the hill really is a parabola, which happens when the data carry a lot of information. Near the boundary, the `r fmt(drop_95, 2)`-unit rule is itself only approximate (the same boundary issue as the LRT), but unlike the curvature it lets the interval reach zero. We check how well each interval actually covers the truth below.
+
+</details>
+
+<details class="fold">
+<summary>A closer look: the three intervals on one trial of each design</summary>
+
+```{r, fig.align="c", fig.width=11, fig.height=4.2, echo=FALSE, eval=TRUE}
+hill_df <- bind_rows(lapply(hills, `[[`, "curve")) |>
+  mutate(design = factor(design, levels = designs)) |>
+  filter(ll >= -8)
+iv_types <- c("Profile likelihood", "Curvature on log γ (± 1.96 SE)",
+              "Curvature on h² (± 1.96 SE)")
+int_df <- bind_rows(lapply(names(hills), function(sc) {
+  h <- hills[[sc]]
+  data.frame(design = designs[[sc]], type = iv_types,
+             lo = c(h$prof[1], h$wald[1], h$wald_h2[1]),
+             hi = c(h$prof[2], h$wald[2], h$wald_h2[2]),
+             y = c(-6.2, -7.1, -8.0))
+})) |>
+  mutate(design = factor(design, levels = designs),
+         type = factor(type, levels = iv_types))
+x_min <- min(0, int_df$lo) - 0.02
+true_df <- data.frame(design = factor(designs, levels = designs),
+                      h2 = sapply(hills, `[[`, "h2_true"))
+ggplot(hill_df, aes(h2, ll)) +
+  geom_hline(yintercept = -drop_95, colour = col_ink, linetype = "dotted", linewidth = 0.5) +
+  geom_vline(data = true_df, aes(xintercept = h2), colour = col_ink, linetype = "dashed") +
+  geom_line(colour = col_main, linewidth = 1.1) +
+  geom_segment(data = int_df, aes(x = lo, xend = hi, y = y, yend = y, colour = type),
+               linewidth = 2.2) +
+  scale_colour_manual(values = c(col_accent, col_third, col_ink), name = NULL) +
+  facet_wrap(~ design) +
+  coord_cartesian(xlim = c(x_min, 0.9)) +
+  guides(colour = guide_legend(nrow = 1)) +
+  labs(title = "The first trial of each design: profile vs curvature intervals",
+       x = expression(h^2), y = "Log-likelihood below the peak") +
+  my_theme
+```
+
+These are the first simulated trials of each design (no selection). In the strong trial the three intervals almost coincide: `r rng_txt(hs$prof)` from the profile likelihood, `r rng_txt(hs$wald)` from the curvature on $\log\gamma$ and `r rng_txt(hs$wald_h2)` from the curvature on $h^2$. In the weak trial the hill is flat and lopsided, and they disagree: `r rng_txt(hw$prof)` from the profile, `r rng_txt(hw$wald)` on $\log\gamma$ and `r rng_txt(hw$wald_h2)` on $h^2$. `r if (hw_in[["profile"]] && !hw_in[["log"]] && !hw_in[["h2"]]) paste0("In this one trial only the profile interval contains the true value, ", fmt(hw$h2_true, 1), "; one trial proves little, and the coverage over all trials is below.") else paste0("The true value, ", fmt(hw$h2_true, 1), ", is inside ", paste(c("the profile interval", "the log-scale interval", "the h² interval")[hw_in], collapse = " and "), " in this one trial; the coverage over all trials is below.")`
+
+</details>
+
+Across all trials, the curvature works in the strong design: its median standard error of $\log\hat\gamma$, `r fmt(ms$se_med, 2)`, matches the actual spread of the estimates across trials (standard deviation `r fmt(ms$sd_lg, 2)`), and the curvature-based interval covered the true value in `r pct(ms$cover_int)` of the trials on the $\log\gamma$ scale and `r pct(ms$cover_h2_int)` on the $h^2$ scale, close to the nominal 95%. In the weak design three things go wrong:
+
+- **The interval depends on the scale.** Among the interior fits, it covered the true value in `r pct(mw$cover_int)` of trials on the $\log\gamma$ scale and `r pct(mw$cover_h2_int)` on the $h^2$ scale.
+- **Boundary fits have no interval.** In `r pct(mw$n_boundary / mw$n)` of the weak trials the peak is at zero, with no curvature to use.
+- **On the $h^2$ scale it usually reaches below zero**, into heritabilities that cannot exist: `r pct(mw$p_below0)` of the interior fits. Truncating it at zero keeps its coverage (still `r pct(mw$cover_h2_int)` of interior fits here, since the true value is above zero), but the interval is then no longer the symmetric one the standard error describes.
+
+The 95% profile-likelihood interval has none of these problems: it is the same on every scale, it exists for every trial, boundary fits included, and it never goes below zero. It covered the true value in `r pct(mw$prof_cover)` of all weak trials, `r pct(mb$prof_cover)` of the baseline trials and `r pct(ms$prof_cover)` of the strong trials. In the weak design it does so by being honest rather than precise: `r mw$prof_zero` of the `r mw$n_prof` weak intervals reach $h^2$ = 0. A profile interval does not make a weak trial informative; it tells you how little the trial knows. That makes it the better interval to report (on profile-likelihood intervals in general, see Pawitan 2001), and it needs nothing more than the log-likelihood evaluated at a range of variance ratios.
+
+<details class="fold">
+<summary>The numbers behind this (coverage, counts and how the intervals were computed)</summary>
+
+Coverage of the nominal 95% intervals, first over the interior fits (where all three exist) and then over all trials, counting a boundary fit as a miss for the curvature intervals, which do not exist there:
+
+- **Weak** (`r mw$n_usable` interior fits of `r mw$n`): $\log\gamma$ scale `r pct(mw$cover_int)`, $h^2$ scale `r pct(mw$cover_h2_int)`, profile `r pct(mw$prof_cover_int)`; over all trials `r pct(mw$cover_all)`, `r pct(mw$cover_h2_all)` and `r pct(mw$prof_cover)`.
+- **Baseline** (`r mb$n_usable` of `r mb$n`): `r pct(mb$cover_int)`, `r pct(mb$cover_h2_int)` and `r pct(mb$prof_cover_int)`; over all trials `r pct(mb$cover_all)`, `r pct(mb$cover_h2_all)` and `r pct(mb$prof_cover)`.
+- **Strong** (`r ms$n_usable` of `r ms$n`): `r pct(ms$cover_int)`, `r pct(ms$cover_h2_int)` and `r pct(ms$prof_cover_int)`; over all trials `r pct(ms$cover_all)`, `r pct(ms$cover_h2_all)` and `r pct(ms$prof_cover)`.
+
+How precise a weak trial looks also depends on the scale. Among its `r mw$n_usable` interior fits, the standard error of $\log\hat\gamma$ ranged from `r rng_txt(mw$se_90)` (middle 90%): near the boundary the hill is almost flat in $\log\gamma$. The standard error of $\hat h^2$ only ranged from `r rng_txt(mw$se_h2_90)`, but `r mw$n_below0` of those `r mw$n_usable` $h^2$ intervals (`r pct(mw$p_below0)`) reached below zero, against `r mb$n_below0` of `r mb$n_usable` in the baseline design and `r ms$n_below0` in the strong one.`r if (mw$n_unusable > 0) paste0(" A further ", mw$n_unusable, " interior fits had a non-positive curvature and are left out.") else ""`
+
+The profile-likelihood intervals were computed by `scripts/profile_coverage.R`, for every one of the `r n_rep` trials of each design; the interval runs down to zero when the log-likelihood at zero genetic variance is within `r fmt(drop_95, 2)` units of the peak. The median upper end of the weak intervals is $h^2$ = `r fmt(mw$prof_hi_med, 2)`.
+
+</details>
+
+<div class="plainwords">
+
+**In plain words:** a trial with little information gives a flat hill. Its peak can land almost anywhere, including at zero, and the standard error printed next to the estimate cannot tell you that: it is computed from the shape of the hill right at the peak, it gives a different interval on each scale, and at zero it does not exist. Look at the whole hill instead.
+
+</div>
+
+<div class="takeaway">
+
+**Takeaway for breeders**
+
+- The same design can give very different variance estimates from trial to trial. In our weak design, the heritability estimates ranged from `r rng_txt(mw$h2_90)` (middle 90%) around a true `r fmt(rw$h2, 1)`, and `r pct(mw$n_boundary / mw$n)` of the trials estimated it as zero.
+- Heritability, predicted gain and reliability from a weak trial are unreliable; rankings from a simple genotype model with similar replication are much less affected.
+- Count and report boundary fits ($\hat\sigma^2_g$ = 0). They say this trial could not separate genetic variance from noise, not that genetic variance is absent.
+- Intervals from standard errors of variance components (the curvature at the peak) are fine in informative trials. In weak trials they depend on the scale they are built on, do not exist for boundary fits and, on the $h^2$ scale, usually reach below zero. Profile-likelihood intervals have none of these problems, and were at or above their nominal 95% coverage, up to simulation noise, in all three of our designs (`r pct(min(sapply(m3, "[[", "prof_cover")))` to `r pct(max(sapply(m3, "[[", "prof_cover")))`); in weak trials they are wide, and that width is the honest answer.
+
+</div>
+
+### Myth 4: "Not converged" is just a warning
+
+Back to the message from the introduction. Like most mixed-model software, ASReml finds the top of the hill by climbing it step by step, with the *average information* (AI) algorithm of Gilmour, Thompson and Cullis (1995): each step uses the slope of the log-likelihood and an approximation to its curvature to jump towards the peak. The program stops when the log-likelihood and the variance components stop changing. If it reaches its iteration limit first, it prints the warning and returns wherever it got to.
+
+```{r, echo=FALSE}
+# The same poor start as the convergence experiment (R/experiments.R).
+poor_start <- c(genotype = 0.001, residual = 10)
+```
+
+To see what that means, we wrote a small AI-REML solver in base R (`R/ai_reml.R` in the repository) that behaves the same way, warnings included. Here it is on the trial of the hill figure, started from a poor guess (genetic variance `r poor_start[["genotype"]]`, residual variance `r poor_start[["residual"]]`, as can happen when starting values are carried over from another trait or scale) and allowed only two iterations:
+
+```{r, echo=TRUE, warning=TRUE}
+effects <- list(genotype = list(Z = dm_1$Z, G = NULL))
+fit_short <- ai_reml(sim_1$y, dm_1$X, effects,
+                     start = c(genotype = 0.001, residual = 10), maxit = 2)
+```
+
+```{r, echo=FALSE}
+fit_full <- suppressWarnings(ai_reml(sim_1$y, dm_1$X, effects, start = poor_start))
+stopifnot(!fit_short$converged, fit_full$converged,
+          abs(fit_full$loglik - fit_1$loglik) < 1e-4)
+one_fit_row <- function(f) {
+  s2 <- f$sigma2
+  g_hat <- blup(sim_1$y, dm_1$X, dm_1$Z, s2[["genotype"]] / s2[["residual"]])$g
+  acc <- accuracy_metrics(g_hat, sim_1$g, g_hat)
+  c(Iterations = f$iterations,
+    Converged = if (f$converged) "yes" else "no",
+    `Log-likelihood` = fmt(f$loglik, 2),
+    `Genetic variance` = fmt(s2[["genotype"]], 3),
+    `Residual variance` = fmt(s2[["residual"]], 3),
+    `Heritability` = fmt(s2[["genotype"]] / sum(s2), 3),
+    `Accuracy, cor(predicted, true)` = fmt(acc$cor, 3),
+    `True top 10% selected` = paste0(round(acc$topk * k_top), " of ", k_top))
+}
+# "Its accuracy moved much less" than the heritability (relative change).
+short_h2 <- fit_short$sigma2[["genotype"]] / sum(fit_short$sigma2)
+full_h2 <- fit_full$sigma2[["genotype"]] / sum(fit_full$sigma2)
+short_cor <- with(fit_short, accuracy_metrics(
+  blup(sim_1$y, dm_1$X, dm_1$Z, sigma2[["genotype"]] / sigma2[["residual"]])$g, sim_1$g, sim_1$g)$cor)
+full_cor <- with(fit_full, accuracy_metrics(
+  blup(sim_1$y, dm_1$X, dm_1$Z, sigma2[["genotype"]] / sigma2[["residual"]])$g, sim_1$g, sim_1$g)$cor)
+stopifnot(abs(short_cor / full_cor - 1) < abs(short_h2 / full_h2 - 1) / 10,
+          fit_full$loglik > fit_short$loglik)   # "below the maximum"
+```
+
+The unconverged fit reports a log-likelihood `r fmt(fit_full$loglik - fit_short$loglik, 1)` units below the maximum and a heritability of `r fmt(fit_short$sigma2[["genotype"]] / sum(fit_short$sigma2), 2)` instead of `r fmt(fit_full$sigma2[["genotype"]] / sum(fit_full$sigma2), 2)`. Its accuracy moved much less, from `r fmt(full_cor, 3)` at convergence to `r fmt(short_cor, 3)`. The log-likelihood our solver reports is the honest one at the point where it stopped, not the maximum.
+
+<details class="fold">
+<summary>The two fits side by side</summary>
+
+```{r, echo=FALSE}
+data.frame(rbind(`Stopped at the limit` = one_fit_row(fit_short),
+                 `Run to convergence` = one_fit_row(fit_full)),
+           check.names = FALSE) |>
+  kable(align = "r")
+```
+
+</details>
+
+#### Across `r n_rep` trials
+
+```{r, echo=FALSE}
+conv <- res$conv |> filter(is.na(error))
+ref <- conv |> filter(start == "default", maxit == max(maxit)) |>
+  select(rep, h2_ref = h2, cor_ref = cor)
+conv_tbl <- conv |>
+  left_join(ref, by = "rep") |>
+  group_by(start, maxit) |>
+  summarise(n = n(),
+            conv = mean(converged),
+            gap_med = median(loglik_gap),
+            h2_lo = quantile(h2, 0.05), h2_hi = quantile(h2, 0.95),
+            dh2_med = median(abs(h2 - h2_ref)),
+            cor_mean = mean(cor),
+            dcor_med = median(abs(cor - cor_ref)),
+            .groups = "drop") |>
+  mutate(start = factor(start, levels = c("default", "poor"))) |>
+  arrange(start, maxit)
+cv_max <- max(conv$maxit)
+c_def1 <- filter(conv_tbl, start == "default", maxit == 1)
+c_poor <- filter(conv_tbl, start == "poor", maxit < cv_max)
+c_ref <- filter(conv_tbl, start == "default", maxit == cv_max)
+worst_cor_shift <- max(abs(conv_tbl$cor_mean - c_ref$cor_mean))
+# Baseline trials whose REML maximum is at zero genetic variance: the solver
+# stops at its lower bound (1e-8 x var(y)), so its BLUPs are tiny but not all
+# equal and their accuracy is defined.
+conv_bnd <- filter(conv, rep %in% res$baseline$rep[res$baseline$boundary], maxit == cv_max)
+stopifnot(length(unique(conv_bnd$rep)) == mb$n_boundary, all(conv_bnd$h2 < 1e-6),
+          !anyNA(conv_bnd$cor))
+stopifnot(
+  length(unique(conv$rep)) == n_rep,
+  all(conv$loglik_gap < 1e-6),                       # never above the maximum
+  all(filter(conv_tbl, maxit == cv_max)$conv == 1),  # all runs converge with enough iterations
+  worst_cor_shift < 0.005,                           # "mean accuracy barely moves"
+  all(c_poor$gap_med < -2 * LRT_CRIT),               # gaps larger than the LRT cutoff
+  all(abs(filter(conv, maxit == cv_max)$loglik_gap) < 1e-6),   # "to the same maximum"
+  -c_def1$gap_med < min(-c_poor$gap_med) / 10,       # sensible start "much more forgiving"
+  c_def1$dh2_med < min(c_poor$dh2_med)
+)
+```
+
+We ran the solver on all `r n_rep` baseline trials from two starting points, a *sensible* one that splits the variance of the data equally between genotype and residual and the *poor* one above, with iteration limits of `r paste(sort(unique(conv$maxit)), collapse = ", ")`. With `r cv_max` iterations every run converged, from either start, to the same maximum the oracle finds.
+
+- **The accuracy hardly moves.** Even the runs stopped after one step from the poor start predicted with a mean accuracy of `r fmt(filter(c_poor, maxit == 1)$cor_mean, 3)`, against `r fmt(c_ref$cor_mean, 3)` at convergence. That matches Myth 2: in this model the rankings barely depend on the variance estimate. (These means include the `r mb$n_boundary` boundary trials; see the fold below.)
+- **Everything else moves.** From the poor start, the median log-likelihood after `r paste(c_poor$maxit, collapse = ", ")` iterations was `r paste(fmt(-c_poor$gap_med, 1), collapse = ", ")` units below the maximum. Any likelihood-ratio test built from such a value is off by twice that, far more than the `r fmt(LRT_CRIT, 2)` cutoff of a 5% test. The heritability is off by a median of `r paste(fmt(c_poor$dh2_med, 2), collapse = ", ")`, and its value depends on where the solver started and when it was stopped.
+- **A sensible start is much more forgiving.** After a single step from the sensible start the median gap was `r fmt(-c_def1$gap_med, 2)` units and the heritability was off by a median of `r fmt(c_def1$dh2_med, 3)`. That is close, but the program cannot tell you from the warning alone which situation you are in.
+
+<details class="fold">
+<summary>The numbers behind this (all starts and iteration limits)</summary>
+
+"Off by" compares each run with the converged fit on the same trial. Across all rows of the table the mean accuracy differs by at most `r fmt(worst_cor_shift, 4)`.
+
+The `r mb$n_boundary` baseline trials whose REML maximum is at zero genetic variance are included here. The solver cannot reach zero: it stops at its lower bound, a genetic variance of 10<sup>-8</sup> times the variance of the data ($h^2$ = `r sci(max(conv_bnd$h2))`), where the BLUPs are tiny but not all equal, so their accuracy is defined. Myths 1 and 3 treat the same trials as boundary fits with no accuracy.
+
+```{r, echo=FALSE}
+data.frame(
+  Start = ifelse(conv_tbl$start == "default", "Sensible", "Poor"),
+  `Iteration limit` = conv_tbl$maxit,
+  Converged = pct(conv_tbl$conv, 0),
+  `Log-lik below maximum (median)` = fmt(-conv_tbl$gap_med, 3),
+  `Heritability, middle 90%` = paste0(fmt(conv_tbl$h2_lo, 2), " to ", fmt(conv_tbl$h2_hi, 2)),
+  `Heritability off by (median)` = fmt(conv_tbl$dh2_med, 3),
+  `Mean accuracy` = fmt(conv_tbl$cor_mean, 3),
+  `Accuracy off by (median)` = fmt(conv_tbl$dcor_med, 4),
+  check.names = FALSE
+) |>
+  kable(align = c("l", "r", "r", "r", "r", "r", "r", "r"))
+```
+
+</details>
+
+#### What the theory does and does not promise
+
+The textbook guarantees (a consistent estimate, standard errors from the information matrix, known distributions for likelihood-ratio tests) are for the REML *maximum*. A run that stops at an iteration limit from an arbitrary start is a different estimator, defined by the start and the limit, with no such guarantee.
+
+<details class="fold">
+<summary>The fine print: what the theory promises, and when one step is enough</summary>
+
+The guarantees in the textbooks are for the REML *maximum*: under normality and regularity conditions (enough levels, true values away from the boundary), the maximizer is consistent and approximately normal, with standard errors from the information matrix (Cressie and Lahiri 1993; Jiang 1996), and likelihood-ratio tests between converged fits have known large-sample distributions, even when the true value of a variance is on the boundary (Self and Liang 1987; Stram and Lee 1994). Strictly, the maximum is not the only estimator with such guarantees: a single Newton-type step from a $\sqrt{n}$-consistent starting value, one whose error already shrinks as fast as that of the estimator itself, is asymptotically as good as the maximum (the one-step estimator; Lehmann and Casella 1998). Our sensible start, half the variance of the data for each component, is not such a value: it is a fixed 50:50 split, not a consistent estimate of either component. A start that is already near the peak behaves similarly in practice, which is what the table shows, but default starting values carry no such guarantee, and a run that stops at an iteration limit from an arbitrary start is a different estimator, defined by the start and the limit, with no guarantee at all.
+
+</details>
+
+<div class="plainwords">
+
+**In plain words:** "Log-likelihood not converged" is not mainly a warning about your BLUPs; in a simple genotype model they are usually fine. It is a warning about every number that is supposed to come from the *top* of the hill: the log-likelihood, likelihood-ratio tests, AIC or BIC, variance components, heritability and their standard errors. Those are reported from wherever the climb stopped.
+
+</div>
+
+<div class="takeaway">
+
+**Takeaway for breeders**
+
+- An unconverged fit can give nearly the same rankings as a converged one, and still report a wrong log-likelihood, wrong variance components and a wrong heritability.
+- Never compare log-likelihoods, run likelihood-ratio tests or report heritability from a fit that has not converged. Run it to convergence (more iterations, better starting values), and check that different starts reach the same maximum.
+- Convergence is about the *validity* of the reported numbers, not a guarantee of more accurate predictions.
+
+</div>
+
+### Checking predictions: cross-validation
+
+```{r, echo=FALSE}
+pick_stats <- function(d) {
+  d <- d[is.na(d$error), ]
+  both_ok <- !d$degenerate_A & !d$degenerate_B
+  # The analysts' predictions differ only when A's extra variance is above
+  # zero; otherwise the two models coincide and their accuracies differ only
+  # by rounding, so there is no "more accurate analyst" to pick.
+  differ <- both_ok & d$sigma2_extra_hat > 0
+  stopifnot(all(d$cor_A[differ] != d$cor_B[differ]))
+  a_better <- d$cor_A > d$cor_B
+  rules <- list(
+    `Higher log-likelihood` = d$loglik_A - d$loglik_B > LOGLIK_TOL,
+    `Likelihood-ratio test at 5%` = d$lrt > LRT_CRIT,
+    `Cross-validation (lower prediction error)` = d$cv_mse_A < d$cv_mse_B
+  )
+  # Reference rules that ignore the data.
+  rules$`Always B (simpler model)` <- rep(FALSE, nrow(d))
+  rules$`Always A (larger model)` <- rep(TRUE, nrow(d))
+  out <- lapply(rules, function(pick_A) {
+    right <- pick_A[differ] == a_better[differ]
+    ci <- binom.test(sum(right), length(right))$conf.int
+    list(p = mean(right), lo = ci[1], hi = ci[2],
+         acc = mean(ifelse(pick_A, d$cor_A, d$cor_B)[both_ok]),
+         pick_A = mean(pick_A[differ]),
+         # Conditional pick rates: P(picks A | A more accurate), P(picks A | B more accurate).
+         k_if_A = sum(pick_A[differ & a_better]), n_if_A = sum(differ & a_better),
+         k_if_B = sum(pick_A[differ & !a_better]), n_if_B = sum(differ & !a_better))
+  })
+  list(rules = out, n_differ = sum(differ), n_ok = sum(both_ok),
+       n_same = sum(both_ok & d$sigma2_extra_hat == 0),
+       max_same = max(abs(d$cor_A - d$cor_B)[both_ok & d$sigma2_extra_hat == 0], 0),
+       a_better = mean(a_better[differ]),
+       acc_A = mean(d$cor_A[both_ok]), acc_B = mean(d$cor_B[both_ok]),
+       cv_ties = sum(d$cv_mse_A == d$cv_mse_B))
+}
+ps <- pick_stats(res$spurious)
+pr <- pick_stats(res$real)
+r_ll <- "Higher log-likelihood"; r_lrt <- "Likelihood-ratio test at 5%"
+r_cv <- "Cross-validation (lower prediction error)"
+r_B <- "Always B (simpler model)"; r_A <- "Always A (larger model)"
+pp <- function(x) paste0(pct(x$p), " (", fmt(100 * x$lo, 0), " to ", fmt(100 * x$hi, 0), "%)")
+cond_txt <- function(x) paste0(x$k_if_A, " of ", x$n_if_A, " (", pct(x$k_if_A / x$n_if_A, 0),
+                               ") where A was more accurate and ", x$k_if_B, " of ", x$n_if_B,
+                               " (", pct(x$k_if_B / x$n_if_B, 0), ") where B was")
+pa <- function(x, rule) x$rules[[rule]]$k_if_A / x$rules[[rule]]$n_if_A
+pb <- function(x, rule) x$rules[[rule]]$k_if_B / x$rules[[rule]]$n_if_B
+
+# Direction words below; knitting stops if a rerun changes them.
+stopifnot(
+  ps$rules[[r_cv]]$p > ps$rules[[r_ll]]$p,     # spurious: CV beats "higher logL"
+  ps$rules[[r_lrt]]$p > ps$rules[[r_ll]]$p,    # spurious: LRT beats "higher logL"
+  pr$rules[[r_ll]]$p > pr$rules[[r_cv]]$p,     # real: "higher logL" beats CV
+  ps$rules[[r_cv]]$acc > ps$rules[[r_ll]]$acc,
+  ps$acc_B > ps$acc_A, pr$acc_A > pr$acc_B,
+  # "about as well": LRT better when spurious, within a point when real
+  ps$rules[[r_lrt]]$p > ps$rules[[r_cv]]$p,
+  abs(pr$rules[[r_lrt]]$p - pr$rules[[r_cv]]$p) < 0.01,
+  # No data-driven rule beat the reference rule that matches the world.
+  ps$rules[[r_B]]$p > max(sapply(ps$rules[c(r_ll, r_lrt, r_cv)], `[[`, "p")),
+  pr$rules[[r_A]]$p >= max(sapply(pr$rules[c(r_ll, r_lrt, r_cv)], `[[`, "p")),
+  ps$rules[[r_B]]$acc > max(sapply(ps$rules[c(r_ll, r_lrt, r_cv)], `[[`, "acc")),
+  # CV and LRT pick A far more often when the term is real (a signal across worlds) ...
+  pr$rules[[r_cv]]$pick_A - ps$rules[[r_cv]]$pick_A > 0.3,
+  pr$rules[[r_lrt]]$pick_A - ps$rules[[r_lrt]]$pick_A > 0.3,
+  # ... but within a world they do not pick A more often when A is the better model.
+  pa(ps, r_cv) <= pb(ps, r_cv), pa(ps, r_lrt) <= pb(ps, r_lrt),
+  pa(pr, r_cv) <= pb(pr, r_cv), pa(pr, r_lrt) <= pb(pr, r_lrt),
+  # CV adopts the spurious term less often than "higher log-likelihood".
+  ps$rules[[r_cv]]$pick_A < ps$rules[[r_ll]]$pick_A,
+  # "protect you from adopting a spurious term most of the time"
+  ps$rules[[r_cv]]$pick_A < 0.5, ps$rules[[r_lrt]]$pick_A < 0.5,
+  # real: "higher log-likelihood" is the same as always choosing the larger model
+  isTRUE(all.equal(pr$rules[[r_ll]]$p, pr$rules[[r_A]]$p)),
+  # "picks A in essentially every trial" / "almost always says A"
+  ps$rules[[r_ll]]$pick_A > 0.95, pr$rules[[r_ll]]$pick_A > 0.95,
+  # real: CV and the LRT "give up some of those trials"
+  pr$rules[[r_lrt]]$p < pr$rules[[r_ll]]$p,
+  # "On individual trials, like the one in the introduction, the difference can be much larger"
+  hook$cor_B - hook$cor_A > 2 * max(diff(range(sapply(ps$rules, `[[`, "acc"))),
+                                    diff(range(sapply(pr$rules, `[[`, "acc"))))
+)
+```
+
+In a real trial nobody knows the true genetic values, so nobody can compute the accuracies in our tables. What a breeder can do is check how well each model predicts data it has not seen. We did this for the two analysts with `r SETTINGS$cv_folds`-fold cross-validation over held-out plots, and picked the analyst with the lower cross-validation error.
+
+<details class="fold">
+<summary>How the cross-validation was done</summary>
+
+The plots of each trial were split at random into `r SETTINGS$cv_folds` groups (a new split for every trial, the same split for both analysts). Each analyst refitted their model, with REML, on `r SETTINGS$cv_folds - 1` groups and predicted the plots of the remaining group from the fitted mean and the predicted effects, and we averaged the squared prediction errors over all plots. A genotype whose only plot is held out is predicted from the mean, plus its family or block effect for Analyst A.
+
+</details>
+
+We compare three rules for choosing between the analysts: pick A when A's log-likelihood is higher, when the likelihood-ratio test is significant at 5%, or when A's cross-validation error is lower; otherwise pick B. A rule is right when it picks the analyst whose predictions were more accurate, which is defined only when A's extra variance is estimated above zero (otherwise the two models coincide).
+
+- **When the family effect is spurious**, "higher log-likelihood" picks A in essentially every trial where A's extra variance is above zero, so it is right only when A happens to be more accurate: `r pct(ps$rules[[r_ll]]$p)` of the time. Cross-validation was right in `r pct(ps$rules[[r_cv]]$p)` of the trials and the likelihood-ratio test in `r pct(ps$rules[[r_lrt]]$p)`. But simply always keeping the simpler model was right in `r pct(ps$rules[[r_B]]$p)`, more than any rule that looks at the data, and gave the highest mean accuracy (`r fmt(ps$rules[[r_B]]$acc)`).
+- **When the block effect is real**, A is the more accurate analyst in `r pct(pr$a_better)` of the trials, so "higher log-likelihood", which almost always says A, is right `r pct(pr$rules[[r_ll]]$p)` of the time, the same as always choosing the larger model. Cross-validation (`r pct(pr$rules[[r_cv]]$p)`) and the likelihood-ratio test (`r pct(pr$rules[[r_lrt]]$p)`) give up some of those trials.
+
+<details class="fold">
+<summary>The numbers behind this (full table, intervals and counts)</summary>
+
+"Higher" means that A's log-likelihood exceeds B's by more than `r sci(LOGLIK_TOL)`. The analysts' predictions differ, and both are defined, in `r ps$n_differ` spurious-family trials and `r pr$n_differ` real-block trials. In the other `r ps$n_same` spurious-family trials with defined predictions, A's model collapsed to B's and the two accuracies were equal up to rounding (at most `r sci(ps$max_same)` apart).
+
+```{r, echo=FALSE}
+rule_names <- names(ps$rules)
+data.frame(
+  Rule = rule_names,
+  `Spurious: picks A` = sapply(ps$rules, function(x) pct(x$pick_A)),
+  `Spurious: picks the more accurate analyst` = sapply(ps$rules, pp),
+  `Spurious: mean accuracy` = sapply(ps$rules, function(x) fmt(x$acc)),
+  `Real: picks A` = sapply(pr$rules, function(x) pct(x$pick_A)),
+  `Real: picks the more accurate analyst` = sapply(pr$rules, pp),
+  `Real: mean accuracy` = sapply(pr$rules, function(x) fmt(x$acc)),
+  check.names = FALSE, row.names = NULL
+) |>
+  kable(align = c("l", "r", "r", "r", "r", "r", "r"))
+```
+
+"Picks A" and "picks the more accurate analyst" are over the `r ps$n_differ` (spurious) and `r pr$n_differ` (real) trials where the analysts differ, the latter with 95% confidence intervals. Mean accuracies are of the predictions each rule chooses, over all trials where both predictions are defined (`r ps$n_ok` and `r pr$n_ok`). The last two rows ignore the data and are there for reference.
+
+</details>
+
+So what do cross-validation and the test actually detect? In the trials where the analysts differ, cross-validation chose A in `r pct(ps$rules[[r_cv]]$pick_A)` of the spurious-family trials and `r pct(pr$rules[[r_cv]]$pick_A)` of the real-block trials; the test in `r pct(ps$rules[[r_lrt]]$pick_A)` and `r pct(pr$rules[[r_lrt]]$pick_A)`. They clearly respond to whether the extra term is real. Within one world, though, they do not tell you which analyst will predict better on the trial in front of you: neither chose A more often when A was actually the better model.
+
+<details class="fold">
+<summary>The numbers behind this (how often each rule chose A)</summary>
+
+In the spurious-family world, cross-validation chose A in `r cond_txt(ps$rules[[r_cv]])`; the test chose A in `r cond_txt(ps$rules[[r_lrt]])`. In the real-block world, cross-validation chose A in `r cond_txt(pr$rules[[r_cv]])`, and the test in `r cond_txt(pr$rules[[r_lrt]])`.
+
+</details>
+
+The honest summary:
+
+- "Higher log-likelihood" is not a decision rule. It says "A" almost every time A's extra variance is above zero, whether or not the term is real.
+- Cross-validation and the likelihood-ratio test detect whether the extra term is real: a signal about the population of trials, not about which model wins on this one. Used that way, they protect you from adopting a spurious term most of the time (cross-validation adopted it in `r pct(ps$rules[[r_cv]]$pick_A)` of the trials where its variance was above zero, against `r pct(ps$rules[[r_ll]]$pick_A)` for "higher log-likelihood"), at some cost when the term is real.
+- For a nested random term like these, the test did about as well as cross-validation: better when the term was spurious (`r pct(ps$rules[[r_lrt]]$p)` against `r pct(ps$rules[[r_cv]]$p)`), within a point when it was real (`r pct(pr$rules[[r_lrt]]$p)` against `r pct(pr$rules[[r_cv]]$p)`).
+- In accuracy terms the stakes per trial are modest on average in this design: the mean accuracies of the five rules lie within `r fmt(diff(range(sapply(ps$rules, "[[", "acc"))), 3)` of each other in the spurious-family world and within `r fmt(diff(range(sapply(pr$rules, "[[", "acc"))), 3)` in the real-block world. On individual trials, like the one in the introduction, the difference can be much larger.
+- Cross-validation's real advantage is that it can be applied where the test cannot: comparing models that are not nested, or models with different fixed effects or relationship matrices.
+
+<details class="fold">
+<summary>Caveats about cross-validation</summary>
+
+- Cross-validation over held-out plots measures how well a model predicts *plot values*, which include field effects, not genetic values directly. If the goal is to predict new genotypes, hold out genotypes instead (all plots of a genotype in the same group).
+- A single `r SETTINGS$cv_folds`-fold split is noisy. Repeating the split several times and averaging is cheap and steadier (we did not test this here).
+- Small differences in cross-validation error are within the noise. When the two models are close, the choice matters little for selection, and the simpler model is a reasonable default.
+
+</details>
+
+### The reveal
+
+```{r, echo=FALSE}
+# Refit the trial of the introduction (spurious-family replicate hook$rep).
+seed_h <- BASE_SEED + hook$rep
+des_h <- make_design(sa$rep_counts, family_size = sa$family_size, seed = seed_h)
+sim_h <- simulate_trial(des_h, h2 = sa$h2, sigma2_family = sa$sigma2_family, seed = seed_h)
+dm_h <- design_matrices(des_h)
+eff_B <- list(genotype = list(Z = dm_h$Z, G = NULL))
+eff_A <- c(eff_B, list(family = list(Z = dm_h$W_family, G = NULL)))
+fit_hA <- reml_dense_fit(sim_h$y, dm_h$X, eff_A)
+fit_hB <- reml_dense_fit(sim_h$y, dm_h$X, eff_B)
+stopifnot(abs(fit_hA$loglik - hook$loglik_A) < 1e-6, abs(fit_hB$loglik - hook$loglik_B) < 1e-6)
+
+# Profile log-likelihood of Analyst A over the family variance ratio.
+setup_hA <- .multi_setup(sim_h$y, dm_h$X, eff_A)
+gf <- c(0, seq(0.005, 0.45, length.out = 60))
+prof_h <- do.call(rbind, lapply(gf, function(g) {
+  o <- optimize(function(lg) .multi_eval(c(exp(lg), g), setup_hA)$loglik,
+                c(log(1e-3), log(10)), maximum = TRUE, tol = 1e-8)
+  e <- .multi_eval(c(exp(o$maximum), g), setup_hA)
+  data.frame(s2f = g * e$sigma2_e, loglik = o$objective)
+}))
+stopifnot(abs(prof_h$loglik[1] - hook$loglik_B) < 1e-4,
+          max(prof_h$loglik) <= hook$loglik_A + 1e-6)
+
+# The prose names Analyst B as the more accurate one.
+stopifnot(hook$cor_B > hook$cor_A, !hook$degenerate_A, !hook$degenerate_B)
+# "A's model also moved part of the genetic variance into the family term."
+stopifnot(fit_hA$sigma2[["genotype"]] < fit_hB$sigma2[["genotype"]],
+          isTRUE(all.equal(fit_hA$sigma2[["family"]], hook$sigma2_extra_hat, tolerance = 1e-4)))
+n_top_A <- round(hook$topk_A * k_top); n_top_B <- round(hook$topk_B * k_top)
+```
+
+The trial in the introduction was simulated in the spurious-family world: there are no family effects. It was replicate `r hook$rep` (seed `r format(seed_h, scientific = FALSE)`), chosen as the first trial of that experiment in which Analyst A's likelihood-ratio test was "significant". Analyst B was right. B's predictions had an accuracy of `r fmt(hook$cor_B)`, A's only `r fmt(hook$cor_A)`. Of the true top `r k_top` genotypes, B's list contained `r n_top_B` and A's `r n_top_A`. `r if (hook$cv_mse_A < hook$cv_mse_B) paste0("Cross-validation would not have saved us in this trial: A's cross-validation error was lower (", fmt(hook$cv_mse_A), " against ", fmt(hook$cv_mse_B), "), one of the ", ps$rules[[r_cv]]$k_if_B, " spurious-family trials in which it chose A although B predicted better.") else paste0("Cross-validation would have picked B (cross-validation error ", fmt(hook$cv_mse_B), " against ", fmt(hook$cv_mse_A), " for A).")`
+
+```{r, fig.align="c", fig.width=8, fig.height=4.2, echo=FALSE, eval=TRUE}
+ggplot(prof_h, aes(s2f, loglik - max(loglik))) +
+  geom_vline(xintercept = 0, colour = col_ink, linetype = "dashed", linewidth = 0.8) +
+  geom_vline(xintercept = fit_hA$sigma2[["family"]], colour = col_accent, linewidth = 0.8) +
+  geom_line(colour = col_main, linewidth = 1.2) +
+  labs(title = "Analyst A's hill for the family variance (the introduction's trial)",
+       subtitle = "Dashed line: the truth (no family effect). Orange line: A's estimate, the peak.",
+       x = "Family variance", y = "Profile log-likelihood below the peak") +
+  my_theme
+```
+
+This is Analyst A's hill, now along the family variance (the genotype and residual variances are re-estimated at each point). Its peak sits at a family variance of `r fmt(fit_hA$sigma2[["family"]], 3)`, and the height of that peak above zero family variance, `r fmt(hook$loglik_A - hook$loglik_B, 2)` units, is exactly the gain in log-likelihood that impressed us in the introduction. But the truth is at zero. The extra height came from chance patterns in this one dataset that happened to line up with the family labels. A's model also moved part of the genetic variance into the family term: A estimated the genotype variance at `r fmt(fit_hA$sigma2[["genotype"]], 3)`, B at `r fmt(fit_hB$sigma2[["genotype"]], 3)` (true value `r fmt(sa$h2, 1)`). Having estimated a family effect, A's predictions move each genotype towards the average of its family, and in this world family members are no more alike than any other genotypes, so that move is noise.
+
+That is the whole article in one trial. The peak was higher, but it was in the wrong place, and where the peak sits is what drives the predictions.
+
+### What these simulations do not cover
+
+```{r, echo=FALSE}
+n_plots_all <- c(sapply(c("analysts", "baseline", "strong"), function(sc) sum(SETTINGS[[sc]]$rep_counts)),
+                 uneven = sum(ru_reps))
+stopifnot(all(sapply(c("analysts", "baseline", "strong", "kinship"),
+                     function(sc) length(SETTINGS[[sc]]$rep_counts)) == n_geno),
+          length(ru_reps) == n_geno)
+```
+
+Every result here comes from simulated single trials at one site, with an overall mean as the only fixed effect, independent normal plot errors with one common variance, and the designs described above (`r n_geno` genotypes in `r min(n_plots_all)` to `r max(n_plots_all)` plots). We did not simulate spatial field trends or heterogeneous error variances, multi-environment trials or genotype-by-environment interaction, non-normal traits (counts, scores, binary data), or pedigree relationships: the relationship model uses one simulated genomic $G$ with strong family structure. Where the results may change:
+
+- **Rankings.** They were robust to the variance estimate only when genotypes were unrelated and similarly replicated. Anything that makes genotypes borrow information unevenly (relationships, very uneven replication, unbalanced multi-environment data, spatial models) is likely to make the rankings depend on the variance estimates, as the relationship model and the uneven-replication check did.
+- **Larger models.** With several variance components (G&times;E, spatial terms, heterogeneous variances) the hill becomes a surface in several dimensions; boundary fits and convergence problems are more common, and the cost of a spurious term or an unconverged fit can be larger.
+- **Interval coverage.** The coverage figures of Myth 3 are for these designs and heritabilities. With more information per trial, intervals from standard errors improve, as in the strong design.
+
+The main points, that log-likelihoods are not comparable across datasets, that a higher log-likelihood does not by itself mean better predictions, and that an unconverged fit reports numbers from the wrong point, rest on how REML works rather than on these particular designs.
+
+### Practical checklist
+
+1. **Do not choose a model because its log-likelihood is higher.** An extra random term that does not exist still raises it in a large share of trials (Myth 1: `r pct(s_sp$p_higher)` with `r n_family` families; in theory about `r pct(p_pos_2)` for a balanced extra term with 2 levels of `r sa$family_size` units each, rising towards 50% as the number of levels grows), and the predictions were then usually worse. For a nested random term, use the boundary-corrected likelihood-ratio test (Self and Liang 1987; Stram and Lee 1994), remembering that it is a large-sample approximation (Crainiceanu and Ruppert 2004).
+2. **Compare log-likelihoods only between models fitted to the same data, in the same units, with the same fixed effects, by the same program** (Myth 1). For fixed effects use maximum likelihood or the method of Welham and Thompson (1997). Never compare across trials.
+3. **Use cross-validation or a proper test to decide whether an extra term is supported, not to predict which model wins on one trial.** Cross-validation adopted the spurious family term far less often than "higher log-likelihood" did, but in our runs it did not beat simply defaulting to the simpler model when the term was spurious. Its advantage is that it also works for models that cannot be compared with a test (cross-validation section). Terms that reflect the randomization (replicates, blocks) stay in the model regardless of any test.
+4. **Report heritability, predicted gain and reliability with their uncertainty.** They move directly with the variance estimate, while rankings in a simple genotype model with similar replication barely do (Myth 2). Reliabilities from prediction error variances ignore the uncertainty in the variance components (Kackar and Harville 1984).
+5. **With a relationship matrix or very uneven replication, the variance estimate affects rankings too** (Myth 2; VanRaden 2008). In our genomic $G$, with strong family structure, much of the loss was in ranking genotypes from different families against each other. Invest in trials that estimate it well.
+6. **Look at the width of the hill.** Use profile-likelihood intervals for variance components and heritability. Intervals from standard errors change with the scale they are built on and do not exist for boundary fits: in our weak design, `r pct(mw$n_boundary / mw$n)` of trials had none, and on the $h^2$ scale `r pct(mw$p_below0)` of the rest reached below zero. Profile intervals covered the true heritability in `r pct(mw$prof_cover)` of all weak trials (Myth 3; Pawitan 2001).
+7. **Count and report boundary fits** ($\hat\sigma^2_g$ = 0). They tell you the trial was too weak, not that there is no genetic variance (Myth 3: `r pct(mw$n_boundary / mw$n)` of our weak trials).
+8. **Treat "Log-likelihood not converged" as an error for every reported number except, in simple models with similar replication, the rankings.** Run to convergence, check different starting values, and only then compare log-likelihoods or report variance components (Myth 4; Gilmour, Thompson and Cullis 1995).
+
+### Conclusions
+
+A REML log-likelihood answers one question: how well do these variance components explain the data in hand, under this model? It does not answer the question a breeder cares about, which is how well the predictions will rank the genotypes. In our simulations, a higher log-likelihood came with worse predictions when the extra model term was spurious and with better ones when it was real; across replicate trials, the trials with higher log-likelihoods were, if anything, the ones with less accurate predictions; and across datasets the comparison is meaningless.
+
+What matters is where the variance estimates land and how well the data pin them down, though not equally for everything. A spurious extra term whose variance lands above zero changes every prediction, usually for the worse. In a simple genotype model with similar replication across genotypes, rankings are robust to a poor estimate of the genetic variance, but heritability, predicted gain and reliability are not; with relationships among genotypes or very uneven replication, rankings move as well. Weak trials give flat hills, scattered estimates and boundary fits; intervals from their standard errors change with the scale, are missing at the boundary and stray below zero, while profile-likelihood intervals avoid all three. And the solver still has to reach the top of the hill: not because the BLUPs change much, but because every number reported from an unconverged fit, the log-likelihood first of all, is not the number the theory is about.
+
+### Reproducibility
+
+The full code used in this analysis is available on GitHub:
+
+<a href="https://github.com/DidierMurilloF/LikelihoodVsAccuracy" target="_blank">
+  <img src="https://img.shields.io/badge/GitHub-181717?style=flat&logo=github&logoColor=white" alt="GitHub">
+</a>
+
+<details class="fold">
+<summary>Seeds, and what is recomputed when the article is knitted</summary>
+
+All models are fitted with the base-R code in `R/`. `scripts/run_simulations.R` runs every experiment with fixed seeds (replicate *r* uses seed `r format(BASE_SEED, scientific = FALSE)` + *r*) and saves the results in `results/`; `scripts/profile_coverage.R` adds the profile-likelihood intervals of Myth 3 and `scripts/robustness_checks.R` the uneven-replication and within-family checks of Myth 2, with the same seeds. The genomic relationship matrix $G$ of the kinship study is built once with seed `r format(BASE_SEED, scientific = FALSE)`, and the cross-validation folds of replicate *r* use seed `r format(BASE_SEED, scientific = FALSE)` + *r* + `r CV_SEED_OFFSET`, so they do not repeat the random layout of the trial. Knitting the article reads those files for every result over replicates and refits only a few single trials live: the oracle check, the likelihood hills, the AI-REML demonstration and the trial of the reveal.
+
+</details>
+
+### References
+
+Crainiceanu, C. M., and Ruppert, D. (2004). Likelihood ratio tests in linear mixed models with one variance component. *Journal of the Royal Statistical Society: Series B*, 66(1), 165–185.
+
+Cressie, N., and Lahiri, S. N. (1993). The asymptotic distribution of REML estimators. *Journal of Multivariate Analysis*, 45(2), 217–233.
+
+Cullis, B. R., Smith, A. B., and Coombes, N. E. (2006). On the design of early generation variety trials with correlated data. *Journal of Agricultural, Biological, and Environmental Statistics*, 11(4), 381–393.
+
+Gilmour, A. R., Thompson, R., and Cullis, B. R. (1995). Average information REML: an efficient algorithm for variance parameter estimation in linear mixed models. *Biometrics*, 51(4), 1440–1450.
+
+Harville, D. A. (1977). Maximum likelihood approaches to variance component estimation and to related problems. *Journal of the American Statistical Association*, 72(358), 320–338.
+
+Henderson, C. R. (1975). Best linear unbiased estimation and prediction under a selection model. *Biometrics*, 31(2), 423–447.
+
+Jiang, J. (1996). REML estimation: asymptotic behavior and related topics. *The Annals of Statistics*, 24(1), 255–286.
+
+Kackar, R. N., and Harville, D. A. (1984). Approximations for standard errors of estimators of fixed and random effects in mixed linear models. *Journal of the American Statistical Association*, 79(388), 853–862.
+
+Lehmann, E. L., and Casella, G. (1998). *Theory of Point Estimation* (2nd ed.). Springer.
+
+Patterson, H. D., and Thompson, R. (1971). Recovery of inter-block information when block sizes are unequal. *Biometrika*, 58(3), 545–554.
+
+Pawitan, Y. (2001). *In All Likelihood: Statistical Modelling and Inference Using Likelihood*. Oxford University Press.
+
+Piepho, H.-P., and Möhring, J. (2007). Computing heritability and selection response from unbalanced plant breeding trials. *Genetics*, 177(3), 1881–1888.
+
+Self, S. G., and Liang, K.-Y. (1987). Asymptotic properties of maximum likelihood estimators and likelihood ratio tests under nonstandard conditions. *Journal of the American Statistical Association*, 82(398), 605–610.
+
+Stram, D. O., and Lee, J. W. (1994). Variance components testing in the longitudinal mixed effects model. *Biometrics*, 50(4), 1171–1177.
+
+VanRaden, P. M. (2008). Efficient methods to compute genomic predictions. *Journal of Dairy Science*, 91(11), 4414–4423.
+
+Welham, S. J., and Thompson, R. (1997). Likelihood ratio tests for fixed model terms using residual maximum likelihood. *Journal of the Royal Statistical Society: Series B*, 59(3), 701–714.
+
+### About the Author
+
+**Didier Murillo** is a statistician and R Shiny developer specializing in agricultural data analytics at North Dakota State University (NDSU). His work focuses on experimental design, predictive pipelines, and the integration of genomic and phenotypic data for predictive modeling in plant breeding. He also develops robust R Shiny applications that turn complex analytical workflows into user-friendly web tools for researchers, breeders, and stakeholders.
+
+### Connect with Didier on
+
+<a href="https://github.com/DidierMurilloF" target="_blank">
+  <img src="https://img.shields.io/badge/GitHub-181717?style=flat&logo=github&logoColor=white" alt="GitHub">
+</a>
+<a href="https://www.linkedin.com/in/damurillof/" target="_blank">
+  <img src="https://img.shields.io/badge/LinkedIn-0A66C2?style=flat&logo=linkedin&logoColor=white" alt="LinkedIn">
+</a>
